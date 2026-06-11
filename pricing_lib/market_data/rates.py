@@ -1,3 +1,17 @@
+"""
+pricing_lib/market_data/rates.py
+─────────────────────────────────────────────────────────────────────────────
+OIS curve — €STR (EONIA replacement).
+
+Source live : app.bluegamma.io/public/swap-rates/table/estr
+Bootstrap : méthode standard Act/360, interpolation log-linéaire.
+
+Classes publiques
+─────────────────
+OISCurve        — courbe bootstrappée, discount factors + zero rates
+fetch_estr_ois  — téléchargement + construction OISCurve en une ligne
+"""
+
 from __future__ import annotations
 
 import math
@@ -8,6 +22,8 @@ import numpy as np
 import requests
 from bs4 import BeautifulSoup
 
+
+# ─── constantes ───────────────────────────────────────────────────────────────
 
 _API_URL = "https://app.bluegamma.io/public/swap-rates/table/estr"
 _HEADERS = {
@@ -20,6 +36,8 @@ _HEADERS = {
 }
 _DAY_COUNT = 360.0  # Act/360
 
+
+# ─── helpers ─────────────────────────────────────────────────────────────────
 
 def _tenor_to_years(tenor: str) -> float:
     """'1Y' → 1.0 | '6M' → 0.5 | '3W' → 0.0583 | '2D' → 0.00556"""
@@ -37,7 +55,13 @@ def _tenor_to_years(tenor: str) -> float:
 
 
 def _bootstrap(rates: Dict[str, float]) -> Dict[float, float]:
-    """Bootstrap discret → discount factors."""
+    """
+    Bootstrap discret → discount factors.
+
+    Hypothèses :
+      - T < 1Y  : taux simple  →  DF = 1 / (1 + r·T)
+      - T ≥ 1Y  : swap annuel  →  DF résiduel depuis la somme des coupons annuels connus
+    """
     items = sorted(((_tenor_to_years(k), k, v) for k, v in rates.items()))
     dfs: Dict[float, float] = {0.0: 1.0}
 
@@ -57,8 +81,25 @@ def _bootstrap(rates: Dict[str, float]) -> Dict[float, float]:
     return dfs
 
 
+# ─── OISCurve ─────────────────────────────────────────────────────────────────
+
 class OISCurve:
-    """Courbe OIS bootstrappée, interpolation log-linéaire."""
+    """
+    Courbe OIS bootstrappée, interpolation log-linéaire.
+
+    Paramètres
+    ----------
+    valuation_date : date
+        Date de valorisation (T=0).
+    dfs : dict[float, float]
+        {tau_en_années: discount_factor}  — sortie de _bootstrap().
+
+    Utilisation
+    -----------
+    >>> curve = OISCurve(date.today(), dfs)
+    >>> curve.df(date.today() + timedelta(days=365))   # DF à 1 an
+    >>> curve.zero_rate(date.today() + timedelta(days=365))
+    """
 
     def __init__(self, valuation_date: date, dfs: Dict[float, float]) -> None:
         self.valuation_date = valuation_date
@@ -130,6 +171,8 @@ class OISCurve:
         )
 
 
+# ─── fetch live ───────────────────────────────────────────────────────────────
+
 def fetch_estr_rates() -> Dict[str, float]:
     """Télécharge les taux €STR depuis bluegamma.io. Retourne {tenor: rate}."""
     r = requests.get(_API_URL, headers=_HEADERS, timeout=15)
@@ -156,7 +199,19 @@ def fetch_estr_rates() -> Dict[str, float]:
 
 
 def fetch_ois_curve(valuation_date: date | None = None) -> OISCurve:
-    """Télécharge, bootstrappe et retourne une OISCurve prête à l'emploi."""
+    """
+    Télécharge, bootstrappe et retourne une OISCurve prête à l'emploi.
+
+    Paramètres
+    ----------
+    valuation_date : date, optional
+        Défaut = date.today()
+
+    Exemple
+    -------
+    >>> curve = fetch_ois_curve()
+    >>> curve.df(date(2027, 1, 1))
+    """
     if valuation_date is None:
         valuation_date = date.today()
     rates = fetch_estr_rates()

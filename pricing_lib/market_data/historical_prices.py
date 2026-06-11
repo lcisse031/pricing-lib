@@ -1,3 +1,20 @@
+"""
+pricing_lib/market_data/historical_prices.py
+─────────────────────────────────────────────────────────────────────────────
+Historiques de prix des sous-jacents — Yahoo Finance.
+
+Utilisé par :
+  - backtest      → revalorisation historique
+  - VaR           → distribution des chocs journaliers
+  - stress test   → scénarios fondés sur historique
+
+Classes / fonctions publiques
+─────────────────────────────
+fetch_history(ticker, start, end, interval)        → pd.Series de close
+fetch_history_multi(tickers, start, end, interval) → pd.DataFrame
+HistoricalPrices                                    — wrapper pratique
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,6 +24,8 @@ from typing import Iterable, Optional, Sequence, Union
 import numpy as np
 import pandas as pd
 
+
+# ─── mapping ticker court CAC 40 → ticker Yahoo ───────────────────────────────
 
 _YF_SUFFIX = ".PA"  # Paris
 
@@ -30,6 +49,8 @@ def _to_yf(ticker: str) -> str:
     return f"{t}{_YF_SUFFIX}"
 
 
+# ─── fetch ────────────────────────────────────────────────────────────────────
+
 def fetch_history(
     ticker:   str,
     start:    Union[str, date, datetime, None] = None,
@@ -37,7 +58,21 @@ def fetch_history(
     interval: str = "1d",
     field:    str = "Close",
 ) -> pd.Series:
-    """Historique de prix d'un sous-jacent."""
+    """
+    Historique de prix d'un sous-jacent.
+
+    Paramètres
+    ----------
+    ticker   : code court (ex: "OR", "MC", "TTE") ou ticker Yahoo direct
+    start    : date début (par défaut 2 ans avant aujourd'hui)
+    end      : date fin (par défaut aujourd'hui)
+    interval : "1d" (défaut), "1wk", "1mo"
+    field    : "Close" (défaut) ou "Adj Close"
+
+    Retourne
+    --------
+    pd.Series (DateTimeIndex, prix close), nommée par le ticker original.
+    """
     try:
         import yfinance as yf
     except ImportError as e:
@@ -98,9 +133,20 @@ def fetch_history_multi(
     return df
 
 
+# ─── wrapper ──────────────────────────────────────────────────────────────────
+
 @dataclass
 class HistoricalPrices:
-    """Conteneur historique multi-tickers prêt à l'emploi."""
+    """
+    Conteneur historique multi-tickers prêt à l'emploi.
+
+    Méthodes utilitaires :
+      - returns()         : log-rendements journaliers
+      - simple_returns()  : rendements simples
+      - rolling_vol(n)    : vol annualisée roulante
+      - last(ticker)      : dernier prix connu
+      - shocks(n)         : matrice (n×k) des n dernières variations relatives
+    """
     prices: pd.DataFrame   # index = dates, columns = tickers
 
     @classmethod

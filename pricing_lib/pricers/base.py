@@ -1,3 +1,9 @@
+"""
+pricing_lib/pricers/base.py
+─────────────────────────────────────────────────────────────────────────────
+Output standardisé pour tous les pricers.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

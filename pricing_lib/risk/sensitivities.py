@@ -1,3 +1,12 @@
+"""
+pricing_lib/risk/sensitivities.py
+─────────────────────────────────────────────────────────────────────────────
+Analyse de scénarios et de sensibilités.
+
+ScenarioAnalyzer — grille de prix (spot × vol)
+StressTest       — scénarios extrêmes prédéfinis
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,8 +18,28 @@ from ..market_data.market_snapshot import MarketSnapshot
 from .greeks import _BumpedMarket
 
 
+# ─── ScenarioAnalyzer ────────────────────────────────────────────────────────
+
 class ScenarioAnalyzer:
-    """Grille de prix en fonction de (spot, vol)."""
+    """
+    Grille de prix en fonction de (spot, vol).
+
+    Paramètres
+    ----------
+    pricer  : objet avec .price(product, market) → obj.price
+    product : produit
+    market  : MarketSnapshot de référence
+    model   : modèle optionnel
+
+    Exemple
+    -------
+    >>> grid = ScenarioAnalyzer(pricer, product, market)
+    >>> df = grid.spot_vol_grid(
+    ...     spot_shocks=[-0.20, -0.10, 0, +0.10, +0.20],
+    ...     vol_shocks=[-0.05, 0, +0.05],
+    ... )
+    >>> print(df)
+    """
 
     def __init__(self, pricer, product, market: MarketSnapshot, model=None) -> None:
         self._pricer  = pricer
@@ -55,6 +84,8 @@ class ScenarioAnalyzer:
         return self._pricer.price(self._product, market).price
 
 
+# ─── StressTest ───────────────────────────────────────────────────────────────
+
 @dataclass(frozen=True)
 class StressScenario:
     name:      str
@@ -80,7 +111,15 @@ STANDARD_STRESSES: List[StressScenario] = [
 
 
 class StressTest:
-    """Stress test d'un produit sur des scénarios prédéfinis ou personnalisés."""
+    """
+    Stress test d'un produit sur des scénarios prédéfinis ou personnalisés.
+
+    Exemple
+    -------
+    >>> st = StressTest(pricer, product, market)
+    >>> df = st.run()
+    >>> print(df)
+    """
 
     def __init__(
         self,

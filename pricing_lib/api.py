@@ -1,21 +1,82 @@
+"""
+pricing_lib/api.py
+─────────────────────────────────────────────────────────────────────────────
+Interface publique unifiée du moteur de pricing et de gestion des risques.
+
+Usage — Pricing
+───────────────
+    from pricing_lib.api import Call, Put, RC, Phoenix, Athena, BonusCertificate
+
+    # Analytique
+    Call('AL', 'GLE', 100, 110, '02/05/2026', '3M')
+
+    # Monte Carlo
+    Call('MC', 'GLE', 20000, 100, 110, '02/05/2026', '3M')
+
+    # Reverse Convertible trimestriel
+    RC('AL', 'GLE', 100, '02/05/2026', '12M', freq='Q')
+
+    # Phoenix
+    Phoenix('MC', 'GLE', 20000, '02/05/2026', 100,
+            barrier_coupon=80, barrier_recall=100, capital_barrier=70,
+            freq_months=3, maturity='60M', kg='no')
+
+Tous les paramètres de marché (r, q, surface de vol) sont récupérés
+automatiquement depuis les sources externes.
+
+Paramètres communs
+──────────────────
+mode        : 'AL' (analytique) | 'MC' (Monte Carlo)
+ticker      : code CAC 40 (ex: 'GLE', 'OR', 'MC', 'TTE')
+n_paths     : nombre de trajectoires MC (ignoré en mode AL)
+spot        : prix spot S₀
+start_date  : date de départ 'DD/MM/YYYY'
+maturity    : maturité '3M', '6M', '12M', '24M', '60M' ou '1Y', '2Y'...
+ratio       : rapport de souscription (défaut 1.0)
+freq        : fréquence coupons 'M'/'Q'/'S'/'A' (défaut 'A')
+
+Usage — Gestion des risques
+────────────────────────────
+    from pricing_lib.api import Greeks, Stress, ScenarioGrid, build_snapshot
+
+    # Greeks d'un Call par différences finies centrées
+    g = Greeks('AL', 'GLE', 100, 100, '02/05/2026', '3M', product='call')
+    print(g)   # Delta, Gamma, Vega, Theta, Rho
+
+    # Stress test multi-scénarios (chocs parallèles spot/vol/taux)
+    df = Stress('AL', 'GLE', 100, '02/05/2026', '3M', product='call', K=100)
+    print(df)
+
+    # Grille spot × vol (analyse historique de sensibilités)
+    df = ScenarioGrid(
+        'AL', 'GLE', 100, 100, '02/05/2026', '3M', product='call',
+        spot_shocks=[-0.20, -0.10, 0, +0.10, +0.20],
+        vol_shocks=[-0.05, 0, +0.05],
+    )
+    print(df)
+
+    # Accès direct au snapshot pour usage avancé avec les classes risk
+    snap = build_snapshot('GLE', 100, '02/05/2026')
+    from pricing_lib.risk import FiniteDiffGreeks, StressTest, ScenarioAnalyzer
+"""
+
 from __future__ import annotations
 
-import math
 import threading
 from datetime import date, datetime
 from typing import List, Optional
 
-from market_data.dividends import fetch_dividend, DividendCurve
-from market_data.rates import fetch_ois_curve
-from market_data.vol_surface import (
+from pricing_lib.market_data.dividends import fetch_dividend, DividendCurve
+from pricing_lib.market_data.rates import fetch_ois_curve
+from pricing_lib.market_data.vol_surface import (
     fetch_option_chain, VolSurface, fetch_market_params, dupire_local_vol,
     _TICKER_MAP as _EURONEXT_MAPPING, _AMSTERDAM_TICKERS,
 )
-from market_data.market_snapshot import MarketSnapshot
-from pricers.base import PricingResult
-from pricers.analytical import AnalyticalPricer
-from pricers.mc import MCPricer
-from pricers.autocalls import PhoenixPricer, AthenaPricer
+from pricing_lib.market_data.market_snapshot import MarketSnapshot
+from pricing_lib.pricers.base import PricingResult
+from pricing_lib.pricers.analytical import AnalyticalPricer
+from pricing_lib.pricers.mc import MCPricer
+from pricing_lib.pricers.autocalls import PhoenixPricer, AthenaPricer
 from pricing_lib.risk import (
     FiniteDiffGreeks, GreeksResult, _ClosurePricer,
     ScenarioAnalyzer, StressTest, STANDARD_STRESSES, StressScenario,
@@ -24,6 +85,8 @@ from pricing_lib.risk import (
 _SNAPSHOT_CACHE: dict = {}
 _SNAPSHOT_LOCK  = threading.Lock()
 
+
+# ─── Helpers de parsing ───────────────────────────────────────────────────────
 
 def _parse_date(s: str) -> date:
     for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%m/%d/%Y"):
@@ -58,6 +121,8 @@ def _to_euronext_symbol(ticker: str) -> str:
     ticker = ticker.upper()
     return _EURONEXT_MAPPING.get(ticker, ticker + "4")
 
+
+# ─── Construction du MarketSnapshot ──────────────────────────────────────────
 
 def _build_snapshot(
     ticker: str,
@@ -125,6 +190,9 @@ def _build_snapshot(
         _SNAPSHOT_CACHE[cache_key] = snap
     return snap
 
+
+
+# ─── API publique ─────────────────────────────────────────────────────────────
 
 def Call(
     mode: str,
@@ -652,6 +720,8 @@ def Athena(
     return result
 
 
+# ─── Risk API ─────────────────────────────────────────────────────────────────
+
 def build_snapshot(ticker: str, spot: float, start_date: str) -> MarketSnapshot:
     """
     Construit et retourne un MarketSnapshot (données de marché complètes).
@@ -757,16 +827,26 @@ def ScenarioGrid(mode: str, ticker: str, *args,
 
 # ── Exemple d'utilisation (exécuter directement : python -m pricing_lib.api) ──
 if __name__ == "__main__":
-    '''
+    
     y = Phoenix('AL', 'GLE', 100000, '29/05/2026', 71,
             barrier_coupon=0.70,
             barrier_recall=1.00,
             capital_barrier=0.50,
-            freq_months=3, maturity='60M', kg='no')
-    #print(y)'''
+            freq_months=3, maturity='12M', kg='no')
+
+    y_mc = Phoenix('MC', 'GLE', 100000, '29/05/2026', 71,
+               coupon=0.0455,
+               barrier_coupon=0.70,
+               barrier_recall=1.00,
+               capital_barrier=0.50,
+               freq_months=3, maturity='60M', kg='no',
+               compute_greeks=True)
+    print(y_mc) 
+    
 
 
-Stress('AL', 'GLE', 100, 100, '02/05/2026', '3M', product='call')
+'''
+Stress('AL', 'GLE', 100, '02/05/2026', '3M', product='call', K=100)
 # Reverse Convertible trimestriel
 Stress('AL', 'GLE', 71, '29/05/2026', '12M', product='rc', freq='Q')
 
@@ -780,4 +860,4 @@ Stress('AL', 'GLE', 71, '29/05/2026', '24M', product='twin_win', X=71, B=46)
 df = Stress('AL', 'GLE', 71, '29/05/2026', '24M', product='airbag', X=71, B=50)
 
 
-print(df)
+print(df)'''

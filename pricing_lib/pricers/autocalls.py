@@ -1,3 +1,25 @@
+"""
+pricing_lib/pricers/autocalls.py
+─────────────────────────────────────────────────────────────────────────────
+Pricing Monte Carlo des autocalls : Phoenix et Athena.
+
+Deux modes disponibles pour chaque produit
+───────────────────────────────────────────
+  mode="AL"  (Réplication)
+      Pas de coupon en entrée.
+      Simule les trajectoires Heston → estime les probabilités de recall/coupon
+      à chaque date → calibre le coupon fair algébriquement :
+          coupon_fair = (1 − Esp_A − Esp_RF) / (Sum_C + Sum_C_final)
+      Prix = 100 % par construction.
+
+  mode="MC"  (Monte Carlo pur)
+      Coupon en entrée (paramètre `coupon`).
+      Simule les trajectoires Heston → actualise les vrais flux path-by-path
+      → retourne le prix en % du nominal.
+      Le coupon_fair est calculé en bonus (info) avec la même formule.
+      Exemple : coupon=0.10 → prix=107 % → coupon trop élevé.
+"""
+
 from __future__ import annotations
 
 import math
@@ -18,6 +40,8 @@ from pricing_lib.pricers.base import PricingResult
 from pricing_lib.pricers.mc import get_heston_params
 
 
+# ─── Helpers dates ────────────────────────────────────────────────────────────
+
 def _observation_dates(start: date, freq_months: int, maturity_months: int):
     """
     Génère les dates d'observation depuis start avec freq_months de pas
@@ -36,6 +60,8 @@ def _observation_dates(start: date, freq_months: int, maturity_months: int):
     taus = np.array([(d - start).days / 365.25 for d in dates])
     return dates, taus
 
+
+# ─── Phoenix ──────────────────────────────────────────────────────────────────
 
 class PhoenixPricer:
     """
@@ -395,6 +421,8 @@ class PhoenixPricer:
         )
 
 
+# ─── Athena ──────────────────────────────────────────────────────────────────
+
 class AthenaPricer:
     """
     Pricing Athena — autocall sans barrière coupon intermédiaire.
@@ -462,7 +490,15 @@ class AthenaPricer:
 
     def _build_masks(self, paths: np.ndarray):
         trigger_r = paths > self.barrier_recall
-        cumul_r   = np.cumsum(trigger_r, axis=1) > 0
+        # Bug #8 fix : cumul_r[:, i] doit indiquer qu'un autocall a eu lieu
+        # STRICTEMENT AVANT la période i, pas à la période i elle-même.
+        # np.cumsum > 0 marque la période i comme "déjà autocallée" dès que
+        # trigger_r[:, i] est True, ce qui empêche de compter le flux à T_i.
+        # Correct : décaler d'une colonne (shifted cumsum).
+        cumsum = np.cumsum(trigger_r, axis=1)
+        # cumul_r[:, i] = True ssi un trigger a eu lieu en [0, i-1]
+        cumul_r = np.zeros_like(trigger_r, dtype=bool)
+        cumul_r[:, 1:] = cumsum[:, :-1] > 0
         has_trigger = trigger_r[:, :-1].any(axis=1)
         return trigger_r, cumul_r, has_trigger, ~has_trigger
 

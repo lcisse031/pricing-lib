@@ -1,3 +1,47 @@
+"""
+pricing_lib/models/heston.py
+─────────────────────────────────────────────────────────────────────────────
+Modèle de Heston (Stochastic Volatility).
+
+Contenu
+───────
+HestonParams          — dataclass des 5 paramètres du modèle
+heston_cf()           — fonction caractéristique (Gatheral / Albrecher 2007)
+heston_price()        — prix call/put semi-fermé via intégration trapézoïdale
+heston_implied_vol()  — conversion prix Heston → vol implicite BS
+_heston_call_vec()    — prix calls vectorisé sur un tableau de strikes (interne)
+calibrate_heston()    — calibration sur VolSurface (DE + L-BFGS-B)
+heston_simulate()     — simulation MC terminale (payoffs vanilles)
+heston_simulate_paths()— simulation MC chemin complet (produits path-dep.)
+
+Optimisations v2
+────────────────
+• heston_price    : quad → np.trapz sur grille fixe ; heston_cf est vectorisé
+                    sur u (numpy), élimine ~200× le surcoût Python/appel.
+• _heston_call_vec: évalue simultanément tous les strikes pour un tenor ;
+                    utilisé dans calibrate_heston pour supprimer la boucle K.
+• calibrate_heston: objectif pré-calcule les prix de marché + normalisation
+                    vega → zéro appel brentq dans la boucle interne.
+                    maxiter DE 100→50, polishing désactivé en DE.
+• heston_simulate : n_steps par défaut 252→100 /an (suffisant en terminal).
+
+Optimisations v3
+────────────────
+• _cf_static / _cf_finish : la CF Heston est décomposée en deux phases.
+  Phase statique  _cf_static(u, params) : calcule d, g, coef — dépend de u
+                  et des params, PAS de T. Résultat réutilisable sur tous les
+                  tenors pour un même jeu de paramètres.
+  Phase dynamique _cf_finish(u, d, g, coef, S, v0, r, q, T, kappa, theta,
+                  sigma_v) : ne calcule que les termes en exp(-d·T) et le
+                  log restant.
+• calibrate_heston : _cf_static est appelé UNE SEULE FOIS par évaluation
+                  d'objectif (hors boucle tenor), puis _cf_finish est appelé
+                  par tenor (5×). Économie : ~(n_T - 1) × 2 sqrt complexe
+                  par éval, soit ~80 % du coût CF éliminé.
+• Grille u réduite 200 → 128 points (précision identique pour la calibration).
+• Exponentielles scalaires (exp(-q·T), etc.) pré-calculées hors objectif.
+"""
+
 from __future__ import annotations
 
 import math
@@ -9,9 +53,21 @@ from scipy.optimize import differential_evolution, minimize
 from scipy.stats import norm as _norm
 
 
+# ─── Dataclass paramètres ────────────────────────────────────────────────────
+
 @dataclass
 class HestonParams:
-    """Paramètres du modèle de Heston (kappa, theta, sigma_v, rho, v0). Feller : 2κθ > σ_v²"""
+    """
+    Paramètres du modèle de Heston.
+
+    kappa   : vitesse de retour à la moyenne de la variance
+    theta   : variance long terme (vol long terme = sqrt(theta))
+    sigma_v : vol de vol
+    rho     : corrélation browniens (S, V)  — typiquement négatif pour actions
+    v0      : variance initiale (vol initiale = sqrt(v0))
+
+    Condition de Feller (variance strictement positive) : 2·κ·θ > σ_v²
+    """
     kappa:   float
     theta:   float
     sigma_v: float
@@ -48,6 +104,8 @@ class HestonParams:
             f"Feller={self.feller:.2f})"
         )
 
+
+# ─── Fonction caractéristique ─────────────────────────────────────────────────
 
 def heston_cf(
     u,          # float scalaire OU np.ndarray complexe — vectorisé sur u
@@ -97,6 +155,9 @@ def heston_cf(
     return np.exp(C + D * v0 + 1j * u * x)
 
 
+# ─── Pricing semi-fermé (scalaire K) ─────────────────────────────────────────
+
+# Grille de quadrature partagée (évite de la recréer à chaque appel)
 # 128 points suffisent pour la calibration (vs 200 avant) — gain ~36 %.
 _U_GRID: Optional[np.ndarray] = None
 _N_QUAD  = 128
@@ -110,6 +171,8 @@ def _get_u_grid() -> np.ndarray:
     return _U_GRID
 
 
+# ─── Décomposition statique / dynamique de la CF ─────────────────────────────
+
 def _cf_static(
     u: np.ndarray,
     kappa: float,
@@ -117,7 +180,18 @@ def _cf_static(
     sigma_v: float,
     rho: float,
 ):
-    """Partie STATIQUE de la fonction caractéristique Heston."""
+    """
+    Partie STATIQUE de la fonction caractéristique Heston.
+
+    Calcule d, g et coef qui dépendent uniquement de (u, params) et PAS de T.
+    Ces quantités sont invariantes pour un même jeu de params sur tous les tenors.
+
+    Retourne
+    --------
+    d    : np.ndarray complexe (N,)
+    g    : np.ndarray complexe (N,)
+    coef : np.ndarray complexe (N,) — kappa − ρ·σ_v·i·u − d
+    """
     iu = 1j * u
     d    = np.sqrt((rho * sigma_v * iu - kappa) ** 2 + sigma_v ** 2 * (iu + u ** 2))
     neg  = kappa - rho * sigma_v * iu - d      # = coef
@@ -140,7 +214,16 @@ def _cf_finish(
     theta: float,
     sigma_v: float,
 ) -> np.ndarray:
-    """Partie DYNAMIQUE de la fonction caractéristique Heston."""
+    """
+    Partie DYNAMIQUE de la fonction caractéristique Heston.
+
+    Reçoit les parties statiques pré-calculées (d, g, coef) et finit le
+    calcul pour un tenor T donné.  Coût : 2 exp complexe + 1 log complexe.
+
+    Retourne
+    --------
+    np.ndarray complexe (N,) — valeurs de la CF
+    """
     x               = np.log(S) + (r - q) * T
     exp_dT          = np.exp(-d * T)
     one_minus_g_exp = 1.0 - g * exp_dT
@@ -213,7 +296,16 @@ def _heston_call_vec(
     params: HestonParams,
     _precomp=None,   # tuple (d_u, g_u, coef_u, d_w, g_w, coef_w, w) pré-calculé
 ) -> np.ndarray:
-    """Prix calls Heston pour un tableau de strikes, un seul tenor."""
+    """
+    Prix calls Heston pour un tableau de strikes, un seul tenor.
+
+    Si _precomp est fourni (optimisation calibration), les parties statiques
+    de la CF (d, g, coef) ne sont pas recalculées — gain ~2× par appel.
+
+    Retourne
+    --------
+    np.ndarray shape (n_K,) — prix call pour chaque strike
+    """
     kappa, theta, sigma_v, rho, v0 = (
         params.kappa, params.theta, params.sigma_v, params.rho, params.v0
     )
@@ -250,6 +342,8 @@ def _heston_call_vec(
     return np.maximum(fwd_S * P1 - fwd_K * P2, np.maximum(fwd_S - fwd_K, 0.0))
 
 
+# ─── Vol implicite Heston → BS ────────────────────────────────────────────────
+
 def heston_implied_vol(
     flag: str,
     S: float,
@@ -268,6 +362,8 @@ def heston_implied_vol(
     price = heston_price(flag, S, K, T, r, q, params)
     return implied_vol(price, S, K, T, r, q, flag)
 
+
+# ─── Détection forward-fill ──────────────────────────────────────────────────
 
 def _mask_forwardfilled(vols: np.ndarray, tol: float = 1e-6) -> np.ndarray:
     """
@@ -293,6 +389,8 @@ def _mask_forwardfilled(vols: np.ndarray, tol: float = 1e-6) -> np.ndarray:
     return mask
 
 
+# ─── Calibration ──────────────────────────────────────────────────────────────
+
 def calibrate_heston(
     vol_surface,
     S: float,
@@ -301,7 +399,27 @@ def calibrate_heston(
     weights: Optional[np.ndarray] = None,
     seed: int = 42,
 ) -> HestonParams:
-    """Calibre les paramètres Heston sur une VolSurface Euronext."""
+    """
+    Calibre les paramètres Heston sur une VolSurface Euronext.
+
+    Minimise la RMSE vol-normalisée entre prix Heston et prix de marché.
+
+    Stratégie :
+    • Objectif vectorisé — _heston_call_vec() calcule tous les strikes d'un
+      tenor en une seule passe numpy ; zéro appel brentq dans la boucle.
+    • Normalisation par vega BSM (pre-calculé hors boucle) — équivalent
+      à une RMSE de vol implicite au premier ordre sans brentq.
+    • Étape 1 : differential_evolution  (maxiter=50, polish=False)
+    • Étape 2 : raffinement L-BFGS-B
+
+    Paramètres
+    ----------
+    vol_surface : VolSurface (grille tenors × strikes × vols)
+    S           : spot
+    r, q        : taux et dividende continus
+    weights     : pondération optionnelle (ignoré, recalculé en interne)
+    seed        : graine pour differential_evolution
+    """
     tenors_all   = vol_surface.tenors
     strikes_all  = vol_surface.strikes
     mkt_vols_all = vol_surface.vols
@@ -349,8 +467,10 @@ def calibrate_heston(
             d2 = d1 - sv * sqrt_T
             # Prix call BSM
             call_mkt = fwd_S * _norm.cdf(d1) - fwd_K * _norm.cdf(d2)
-            # Pour un put OTM, convertir par parité
-            if K < S * math.exp((r - q) * T):
+            # Bug #5 fix : utiliser le put OTM (parité) quand K > Forward
+            # K < Forward → call OTM → utiliser call directement (moins de valeur intrinsèque)
+            # K > Forward → put OTM → parité : put = call + fwd_K - fwd_S
+            if K > S * math.exp((r - q) * T):
                 mkt_prices[i, j] = call_mkt + fwd_K - fwd_S
             else:
                 mkt_prices[i, j] = call_mkt
@@ -385,6 +505,7 @@ def calibrate_heston(
                 if T <= 0:
                     continue
 
+                # Partie dynamique uniquement (exp + log sur T) — pas de sqrt ici
                 model_calls = _heston_call_vec(S, strikes, T, r, q, hp, _precomp=precomp)
 
                 # Parité call-put vectorisée
@@ -451,6 +572,8 @@ def calibrate_heston(
     return params
 
 
+# ─── Simulation MC terminale ──────────────────────────────────────────────────
+
 def heston_simulate(
     S: float,
     r: float,
@@ -462,7 +585,19 @@ def heston_simulate(
     antithetic: bool = True,
     seed: Optional[int] = None,
 ) -> np.ndarray:
-    """Simulation MC Heston — retourne les prix terminaux S_T."""
+    """
+    Simulation MC Heston — retourne les prix terminaux S_T.
+
+    Schéma Euler-Maruyama + full truncation sur V.
+
+    n_steps par défaut : 100/an (au lieu de 252) — suffisant pour les
+    produits à payoff terminal (vanilles, certificats sans barrière continue).
+    Pour les produits path-dépendants utilisez heston_simulate_paths.
+
+    Retourne
+    --------
+    np.ndarray shape (n_paths,)
+    """
     if n_steps is None:
         n_steps = max(int(100 * T), 30)   # 100/an suffit pour payoff terminal
 
@@ -504,6 +639,8 @@ def heston_simulate(
     return np.exp(log_S)
 
 
+# ─── Simulation MC chemin complet ─────────────────────────────────────────────
+
 def heston_simulate_paths(
     S: float,
     r: float,
@@ -516,7 +653,23 @@ def heston_simulate_paths(
     antithetic: bool = True,
     seed: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Simulation MC Heston avec enregistrement aux dates d'observation."""
+    """
+    Simulation MC Heston avec enregistrement aux dates d'observation.
+
+    Utilisée pour les produits path-dépendants :
+    autocalls, options à barrières, phoenix, athena.
+
+    n_steps conservé à 252/an pour la précision des barrières continues.
+
+    Paramètres
+    ----------
+    observation_times : np.ndarray (n_obs,) — en années depuis aujourd'hui
+
+    Retourne
+    --------
+    times  : np.ndarray (n_obs,)
+    paths  : np.ndarray (n_paths, n_obs)
+    """
     if n_steps is None:
         n_steps = max(int(252 * T), 50)   # 252/an — précision barrière continue
 
@@ -569,6 +722,8 @@ def heston_simulate_paths(
     return observation_times, paths
 
 
+# ─── Paramètres par défaut (desk) ─────────────────────────────────────────────
+
 DEFAULT_HESTON = HestonParams(
     kappa=2.0,
     theta=0.04,    # vol long terme 20%
@@ -576,3 +731,4 @@ DEFAULT_HESTON = HestonParams(
     rho=-0.70,
     v0=0.04,       # vol initiale 20%
 )
+

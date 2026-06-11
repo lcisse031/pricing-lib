@@ -1,21 +1,30 @@
+"""
+pricing_lib/pricers/analytical.py
+─────────────────────────────────────────────────────────────────────────────
+Pricer analytique — wrapper autour de Produit_pricing/pdts.py.
+
+Pour chaque produit :
+1. Reçoit les paramètres utilisateur + MarketSnapshot
+2. Extrait r, q, sigma depuis le snapshot
+3. Appelle la fonction pdts.py correspondante
+4. Calcule les Greeks par différences finies
+5. Retourne un PricingResult
+
+Convention vol :
+    Vanilles (call / put / warrant) → vol implicite marché σ_IV(T, K).
+    Exotiques / barrières             → vol locale Dupire σ_loc(T, K).
+"""
+
 from __future__ import annotations
 
 import math
-import sys
-import os
 from datetime import date, timedelta
 from typing import List, Optional
-from functools import partial
 
 import numpy as np
 import pandas as pd
 
-# Import pdts depuis Produit_pricing
-_HERE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
-
-from Produit_pricing.pdts import (
+from pricing_lib.pricers.Produit_pricing.pdts import (
     # Cat 1
     warrant, straddle, strangle,
     turbo_certificate, turbo_strangle,
@@ -45,6 +54,8 @@ from pricing_lib.market_data.vol_surface import dupire_local_vol
 from pricing_lib.pricers.base import PricingResult
 from pricing_lib.pricers.greeks import compute_greeks
 
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def _freq_map(freq: str) -> int:
     """'M'->12, 'Q'->4, 'S'->2, 'A'->1 paiements par an."""
@@ -140,8 +151,23 @@ def _rc_price_with_freq(
     return (bond - sp * ratio) / nominal * 100.0
 
 
+# ─── Pricer analytique ────────────────────────────────────────────────────────
+
 class AnalyticalPricer:
-    """Pricer analytique unifié."""
+    """
+    Pricer analytique unifié.
+
+    Convention de volatilité
+    ────────────────────────
+    • Vanilles (Call, Put, Warrant) : vol implicite de marché σ_IV(T, K)
+      = interpolation directe de la surface.
+      → BS(σ_IV) = prix de marché par définition ; cohérent avec le MC Heston.
+
+    • Produits à barrière/exotiques : vol locale σ_loc(T, K) via Dupire.
+      → capture la dynamique de smile pour les payoffs path-dépendants.
+
+    Tous les produits ont la même signature de retour : PricingResult.
+    """
 
     def __init__(self, snapshot: MarketSnapshot):
         self.snap = snapshot

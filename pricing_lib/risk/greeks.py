@@ -1,3 +1,25 @@
+"""
+pricing_lib/risk/greeks.py
+─────────────────────────────────────────────────────────────────────────────
+Greeks par différences finies centrées.
+
+FiniteDiffGreeks encapsule n'importe quel pricer callable et calcule
+Delta, Gamma, Vega, Theta, Rho par perturbation des paramètres.
+
+Compatible avec AnalyticalPricer et MonteCarloPricer (les deux retournent
+un objet avec un attribut .price).
+
+Usage
+-----
+>>> from pricing_lib.pricers import AnalyticalPricer
+>>> from pricing_lib.risk.greeks import FiniteDiffGreeks
+>>>
+>>> pricer  = AnalyticalPricer()
+>>> greeks  = FiniteDiffGreeks(pricer, product, market)
+>>> print(greeks.delta())
+>>> print(greeks.all())
+"""
+
 from __future__ import annotations
 
 import math
@@ -6,6 +28,8 @@ from typing import Optional
 
 from ..market_data.market_snapshot import MarketSnapshot
 
+
+# ─── résultat ────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
 class GreeksResult:
@@ -25,8 +49,26 @@ class GreeksResult:
         )
 
 
+# ─── FiniteDiffGreeks ────────────────────────────────────────────────────────
+
 class FiniteDiffGreeks:
-    """Greeks par différences finies centrées sur le MarketSnapshot."""
+    """
+    Greeks par différences finies centrées sur le MarketSnapshot.
+
+    Paramètres
+    ----------
+    pricer  : objet avec méthode .price(product, market[, model]) -> obj.price
+    product : produit à pricer
+    market  : MarketSnapshot de référence
+    model   : modèle optionnel (passé au pricer si fourni)
+
+    Bumps par défaut
+    ----------------
+    dS    : 0.1% de S     (Delta, Gamma)
+    dsig  : 1bp de vol    (Vega)
+    dT    : 1 jour        (Theta)
+    dr    : 1bp de taux   (Rho)
+    """
 
     def __init__(
         self,
@@ -110,6 +152,8 @@ class FiniteDiffGreeks:
             result = self._pricer.price(product, market)
         return result.price
 
+
+# ─── bump helpers ─────────────────────────────────────────────────────────────
 
 class _BumpedVolSurface:
     """
@@ -199,6 +243,8 @@ def _bump_product_maturity(product, dT: float):
             return dataclasses.replace(product, maturity=product.maturity + dT)
     return product
 
+
+# ─── Adaptateur générique ─────────────────────────────────────────────────────
 
 class _ClosurePricer:
     """

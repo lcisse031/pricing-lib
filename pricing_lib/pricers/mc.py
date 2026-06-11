@@ -1,8 +1,22 @@
+"""
+pricing_lib/pricers/mc.py
+─────────────────────────────────────────────────────────────────────────────
+Pricer Monte Carlo Heston — vanilles et produits à barrières.
+
+Pour chaque produit :
+1. Calibre Heston sur la VolSurface (ou utilise un cache)
+2. Simule N trajectoires
+3. Calcule le payoff par trajectoire
+4. Actualise et moyenne
+5. Greeks par finite differences MC
+6. Retourne PricingResult
+
+Cache de calibration : {ticker: HestonParams} — 1 calibration par session par ticker.
+"""
+
 from __future__ import annotations
 
 import math
-import os
-import sys
 from datetime import date
 from typing import Dict, Optional
 
@@ -16,13 +30,14 @@ from pricing_lib.models.heston import (
     heston_simulate, heston_simulate_paths,
     calibrate_heston,
 )
-from pricing_lib.models.heston2 import heston_monte_carlo
 from pricing_lib.pricers.base import PricingResult
 from pricing_lib.pricers.greeks import compute_greeks_mc
 
 
+# ─── Seed fixe pour les Greeks (différences finies reproductibles) ───────────
 _GREEK_SEED: int = 42   # toutes les closures pfn utilisent ce seed → aléas identiques
 
+# ─── Cache calibration ────────────────────────────────────────────────────────
 
 _HESTON_CACHE: Dict[str, HestonParams] = {}
 
@@ -55,8 +70,26 @@ def get_heston_params(
     return params
 
 
+# ─── Pricer MC ────────────────────────────────────────────────────────────────
+
 class MCPricer:
-    """Pricer Monte Carlo Heston."""
+    """
+    Pricer Monte Carlo Heston.
+
+    Produits supportés :
+    - Call / Put (vanilles)
+    - Warrant
+    - Bonus Certificate
+    - Capped Bonus Certificate
+    - Reverse Bonus Certificate
+    - Discount Certificate
+    - Reverse Convertible (avec fréquence)
+    - Outperformance Certificate
+    - Sprint Certificate
+    - Twin Win Certificate
+    - Airbag Certificate
+    - Garantie Certificate
+    """
 
     def __init__(
         self,
@@ -308,7 +341,10 @@ class MCPricer:
         payoff_T   = np.where(ST >= cap, nominal, ST * ratio_conv)
         redemption = float(np.mean(payoff_T) * df_T * ratio)
 
-        price = (bond_pv + redemption - nominal) / nominal * 100.0 + 100.0
+        # Bug #4 fix : prix = (coupons actualisés + remboursement final) / nominal
+        # L'ancienne formule (bond + redemption - nominal)/nominal*100 + 100
+        # double-comptait le nominal. La formule correcte est directe :
+        price = (bond_pv + redemption) / nominal * 100.0
 
         def pfn(S_arg, r, q, T, params=None):
             _ST = heston_simulate(S=S_arg, r=r, q=q, T=T,
@@ -318,7 +354,7 @@ class MCPricer:
             _redemption = float(np.mean(np.where(_ST >= cap, nominal, _ST * ratio_conv))
                                 * self.snap.ois_curve.df_tau(T) * ratio)
             _bond = _bond_value(nominal, coupon, freq, T, start, self.snap)
-            return (_bond + _redemption - nominal) / nominal * 100.0 + 100.0
+            return (_bond + _redemption) / nominal * 100.0
 
         greeks = compute_greeks_mc(pfn, price, S, r, q, T, self.params)
         cf_df  = _cashflow_df(nominal, coupon, freq, T, start, self.snap)
@@ -350,11 +386,7 @@ class MCPricer:
         Retourne 1.0 en cas d'échec.
         """
         try:
-            _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            if _root not in sys.path:
-                sys.path.insert(0, _root)
-            import importlib
-            pdts = importlib.import_module("Produit_pricing.pdts")
+            from pricing_lib.pricers.Produit_pricing import pdts
             fn = getattr(pdts, fn_name)
             return float(fn(*args))
         except Exception as e:

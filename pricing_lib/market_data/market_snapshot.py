@@ -1,3 +1,15 @@
+"""
+pricing_lib/market_data/market_snapshot.py
+─────────────────────────────────────────────────────────────────────────────
+Agrégation de toutes les données de marché pour un sous-jacent unique.
+
+MarketSnapshot est l'objet passé aux Pricers — il contient :
+  - spot price
+  - OIS curve  (discount factors)
+  - dividend curve  (taux q)
+  - vol surface  (IV interpolée)
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,7 +23,23 @@ from .vol_surface import VolSurface
 
 @dataclass
 class MarketSnapshot:
-    """Données de marché agrégées pour un sous-jacent."""
+    """
+    Données de marché agrégées pour un sous-jacent.
+
+    Paramètres
+    ----------
+    ticker          : str         — code du sous-jacent
+    valuation_date  : date
+    spot            : float       — prix spot S₀
+    ois_curve       : OISCurve
+    div_curve       : DividendCurve
+    vol_surface     : VolSurface
+
+    Propriétés calculées
+    --------------------
+    r   : taux sans risque OIS à 1 an (proxy continu)
+    q   : taux de dividende continu
+    """
 
     ticker:         str
     valuation_date: date
@@ -52,7 +80,16 @@ class MarketSnapshot:
 
 @dataclass
 class MultiAssetSnapshot:
-    """Données de marché pour un panier multi-actifs (worst-of, basket options)."""
+    """
+    Données de marché pour un panier multi-actifs (worst-of, basket options).
+
+    Paramètres
+    ----------
+    assets          : list[MarketSnapshot]   — un snapshot par sous-jacent
+    corr_matrix     : np.ndarray             — matrice de corrélation N×N
+    valuation_date  : date
+    ois_curve       : OISCurve               — courbe commune de discount
+    """
 
     import numpy as np
 

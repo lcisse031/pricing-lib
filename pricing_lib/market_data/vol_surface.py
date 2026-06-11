@@ -1,3 +1,22 @@
+"""
+pricing_lib/market_data/vol_surface.py
+─────────────────────────────────────────────────────────────────────────────
+Surface de volatilité implicite — extraction depuis Euronext + Dupire.
+
+Pipeline
+────────
+1.  fetch_option_chain()    — chaîne d'options live Euronext (parallélisé)
+2.  implied_vol()           — extraction σ_i par inversion de BS (Brent)
+3.  VolSurface              — grille (T, K) → σ_i + interpolation 2D
+4.  dupire_local_vol()      — vol locale σ_loc(T, K) via formule de Dupire
+5.  build_surface()         — interface simplifiée
+
+Interface publique
+──────────────────
+build_surface(ticker)       — construit une surface complète en une ligne
+compute_dupire_surface()    — calcule la vol locale sur la surface
+"""
+
 from __future__ import annotations
 
 import calendar
@@ -20,6 +39,8 @@ from scipy.stats import norm
 from .rates import fetch_ois_curve
 from .dividends import fetch_dividend
 
+
+# ─── constantes ───────────────────────────────────────────────────────────────
 
 _EURONEXT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -45,11 +66,13 @@ _TICKER_MAP = {
     "ACA":   "CR4",   # Crédit Agricole
     "BN":    "BN4",    # Danone
 
+    # --- Luxe & Cosmétiques ---
     "MC":    "MC4",    # LVMH
     "RMS":   "HE4",   # Hermès International
     "OR":    "OR4",    # L'Oréal
     "KER":   "KR4",   # Kering
 
+    # --- Industrie & Aéronautique ---
     "SAF":   "SM4",   # Safran
     "HO":    "HO4",    # Thales
     "SU":    "SU4",    # Schneider Electric
@@ -58,36 +81,47 @@ _TICKER_MAP = {
     "MT":    "MT9",    # ArcelorMittal
     "STMPA": "STM4",   # STMicroelectronics
 
+    # --- Finance & Assurance ---
     "CS":    "CS4",    # AXA
 
+    # --- Énergie ---
     "TTE":   "TO4",   # TotalEnergies
     "ENGI":  "ENGI4",  # Engie
     "VIE":   "VIE4",   # Veolia Environnement
 
+    # --- Santé ---
     "SAN":   "ZA4",   # Sanofi
     "EL":    "EL4",    # EssilorLuxottica
     "ERF":   "ERF4",   # Eurofins Scientific
 
+    # --- BTP & Concessions ---
     "DG":    "DG4",    # Vinci
     "FGR":   "FGR4",   # Eiffage
 
+    # --- Automobile ---
     "STLAP": "STL4",   # Stellantis
     "ML":    "ML4",    # Michelin
     "RNO":   "RN4",   # Renault
 
+    # --- Technologie ---
     "DSY":   "DS4",   # Dassault Systèmes
     "CAP":   "CP4",   # Capgemini
 
+    # --- Agroalimentaire ---
     "RI":    "RI4",    # Pernod Ricard
 
+    # --- Télécoms ---
     "ORA":   "FT4",   # Orange
 
+    # --- Services ---
     "BVI":   "BVI4",   # Bureau Veritas
     "PUB":   "PU4",   # Publicis Groupe
     "ENX":   "ENX4",   # Euronext
 
+    # --- Hôtellerie & Distribution ---
     "AC":    "AC4",    # Accor
 
+    # --- Immobilier ---
     "URW":   "UB9",   # Unibail-Rodamco-Westfield
 }
 
@@ -96,6 +130,8 @@ _AMSTERDAM_TICKERS = {"MT", "URW"}
 
 _IV_BOUNDS = (1e-4, 5.0)
 
+
+# ─── fetch Market Params ───────────────────────────────────────────────────────
 
 def fetch_market_params(ticker: str, valuation_date: Optional[date] = None) -> Tuple[float, float]:
     """Récupère (r, q) automatiquement depuis OIS + dividendes."""
@@ -116,6 +152,9 @@ def fetch_market_params(ticker: str, valuation_date: Optional[date] = None) -> T
 
     return r, q
 
+
+
+# ─── fetch Euronext (rapide + parallélisé) ────────────────────────────────────
 
 def fetch_option_chain(symbol: str, exchange: str, verbose: bool = True) -> pd.DataFrame:
 
@@ -275,6 +314,8 @@ def fetch_option_chain(symbol: str, exchange: str, verbose: bool = True) -> pd.D
     return df.sort_values(["expiry_date", "strike", "type"]).reset_index(drop=True)
 
 
+# ─── vol implicite ────────────────────────────────────────────────────────────
+
 def _bs_price(flag: int, S: float, K: float, T: float, r: float, q: float, sigma: float) -> float:
     """Prix Black-Scholes (flag=+1 call, flag=-1 put)."""
     if T <= 0 or sigma <= 0:
@@ -317,6 +358,8 @@ def implied_vol(
     except (ValueError, RuntimeError):
         return None
 
+
+# ─── VolSurface ───────────────────────────────────────────────────────────────
 
 class VolSurface:
     """Surface de volatilité implicite interpolée (T, K) → σ_i."""
@@ -600,6 +643,8 @@ class VolSurface:
         plt.show()
 
 
+# ─── vol locale (Dupire) ───────────────────────────────────────────────────────
+
 def dupire_local_vol(
     surf: VolSurface,
     T: float,
@@ -683,6 +728,8 @@ def dupire_local_vol(
     return float(np.clip(math.sqrt(local_var), 0.01, 3.0))
 
 
+# ─── interface simplifiée (build_surface) ─────────────────────────────────────
+
 def _cache_path(ticker: str) -> str:
     """Chemin du fichier cache pour un ticker donné."""
     cache_dir = os.path.join(os.path.dirname(__file__), ".vol_cache")
@@ -691,7 +738,24 @@ def _cache_path(ticker: str) -> str:
 
 
 def build_surface(ticker: str, spot: float) -> VolSurface:
-    """Construit une VolSurface en UNE LIGNE."""
+    """
+    Construit une VolSurface en UNE LIGNE.
+
+    Stratégie :
+    1. Tente de récupérer les données live Euronext
+    2. Si les données sont insuffisantes (marché fermé, hors heures), charge
+       le cache disque du dernier snapshot valide
+    3. Si les données live sont bonnes, sauvegarde le cache pour les prochains appels
+
+    Parameters
+    ----------
+    ticker : str  — ticker Bloomberg (GLE, AI, BNP, etc.)
+    spot   : float — cours spot actuel
+
+    Returns
+    -------
+    VolSurface prête pour les pricers / Dupire
+    """
     t        = ticker.upper()
     euronext = _TICKER_MAP.get(t, t)
     exchange = "DAMS" if t in _AMSTERDAM_TICKERS else "DPAR"
@@ -746,6 +810,8 @@ def compute_dupire_surface(
     return pd.DataFrame(records)
 
 
+# ─── helpers ───────────────────────────────────────────────────────────────────
+
 def _pf(s) -> Optional[float]:
     """Parse float from string."""
     if s is None:
@@ -791,3 +857,5 @@ def _parse_maturity_to_yyyy_mm(s: str) -> str:
         return f"{year}-{month_num}"
 
     return s
+
+

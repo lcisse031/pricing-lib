@@ -1,3 +1,8 @@
+"""
+pricing_lib/market_data/dividends.py
+Source : zonebourse.com (table #dividendTable)
+"""
+
 from __future__ import annotations
 
 import re
@@ -5,7 +10,6 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
 
 
 _ZB_CODES: Dict[str, str] = {
@@ -145,6 +149,7 @@ def fetch_dividend(ticker: str) -> DividendYield:
 
     url = f"https://www.zonebourse.com/cours/action/{code}/valorisation-dividende/"
 
+    from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         browser = p.chromium.launch(
             channel="chrome",
@@ -256,3 +261,5 @@ def fetch_dividend(ticker: str) -> DividendYield:
 
 def flat_dividend(ticker: str, q: float) -> DividendCurve:
     return DividendCurve(ticker, q)
+
+
