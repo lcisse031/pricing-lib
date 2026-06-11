@@ -24,7 +24,7 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 
-from pricing_lib.pricers.Produit_pricing.pdts import (
+from pricing_lib.pricers.core.pdts import (
     # Cat 1
     warrant, straddle, strangle,
     turbo_certificate, turbo_strangle,
@@ -409,7 +409,7 @@ class AnalyticalPricer:
         def price_at_coupon(c):
             bond  = _bond_value(nominal, c, freq, T, start, snap)
             ratio = nominal / cap
-            from Produit_pricing.pdts import _gbs, _barrier
+            from pricing_lib.pricers.core.pdts import _gbs, _barrier
             b = r - q
             sp  = _gbs("p", S, cap, T, r, b, sigma)
             dop = 0.0 if barrier_hit else _barrier("pdo", S, cap, B, 0.0, T, r, b, sigma)
@@ -418,7 +418,7 @@ class AnalyticalPricer:
         coupon = brentq(price_at_coupon, 0.0, 2.0, xtol=1e-8)
 
         def _pfn(S, r, q, sigma, T):
-            from Produit_pricing.pdts import _gbs, _barrier
+            from pricing_lib.pricers.core.pdts import _gbs, _barrier
             bond  = _bond_value(nominal, coupon, freq, T, start, snap)
             ratio = nominal / cap
             b = r - q

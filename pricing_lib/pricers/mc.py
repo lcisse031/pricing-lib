@@ -386,7 +386,7 @@ class MCPricer:
         Retourne 1.0 en cas d'échec.
         """
         try:
-            from pricing_lib.pricers.Produit_pricing import pdts
+            from pricing_lib.pricers.core import pdts
             fn = getattr(pdts, fn_name)
             return float(fn(*args))
         except Exception as e:
