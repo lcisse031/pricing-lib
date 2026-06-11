@@ -431,16 +431,28 @@ def calibrate_heston(
         print(f"[Heston] {n_masked} cellule(s) forward-fill détectée(s) et exclues de la calibration.")
     mkt_vols_all = np.where(ff_mask, np.nan, mkt_vols_all)
 
-    # ── Sous-échantillonnage : 5 tenors × 5 strikes ──────────────────────────
+    # ── Sous-échantillonnage ─────────────────────────────────────────────────
     n_T, n_K = len(tenors_all), len(strikes_all)
-    t_idx = np.linspace(0, n_T - 1, min(5, n_T), dtype=int)
-    atm_j = int(np.argmin(np.abs(strikes_all - S)))
-    k_idx = np.unique(np.clip(
-        np.linspace(atm_j - 2, atm_j + 2, min(5, n_K), dtype=int), 0, n_K - 1
-    ))
-    tenors   = tenors_all[t_idx]
-    strikes  = strikes_all[k_idx]
-    mkt_vols = mkt_vols_all[np.ix_(t_idx, k_idx)]   # (n_T_sub, n_K_sub)
+
+    # 5 maturités les plus denses en données
+    valid_per_row = np.sum(~np.isnan(mkt_vols_all) & (mkt_vols_all > 0), axis=1)
+    top5_t = np.argsort(valid_per_row)[::-1][:5]
+    t_idx  = np.sort(top5_t)
+    tenors = tenors_all[t_idx]
+
+    # 5 strikes par moneyness cible {0.90, 0.95, 1.00, 1.05, 1.10}
+    target_m  = [0.90, 0.95, 1.00, 1.05, 1.10]
+    K_targets = np.array([m * S for m in target_m])
+    strikes   = K_targets
+
+    # Interpolation linéaire de mkt_vols sur K_targets pour chaque tenor
+    mkt_vols = np.full((len(t_idx), len(K_targets)), np.nan)
+    for i, ti in enumerate(t_idx):
+        row   = mkt_vols_all[ti]
+        valid = ~np.isnan(row) & (row > 0)
+        if valid.sum() < 2:
+            continue
+        mkt_vols[i] = np.interp(K_targets, strikes_all[valid], row[valid])
 
     # ── Pondération gaussienne ATM ────────────────────────────────────────────
     moneyness = strikes / S
@@ -452,6 +464,7 @@ def calibrate_heston(
     sqrt_2pi = math.sqrt(2.0 * math.pi)
     mkt_prices  = np.zeros_like(mkt_vols)
     vega_norm   = np.zeros_like(mkt_vols)
+    w_sigma     = np.ones_like(mkt_vols)   # correction 6 : poids niveau de vol
 
     for i, T in enumerate(tenors):
         if T <= 0:
@@ -465,17 +478,13 @@ def calibrate_heston(
             fwd_K = K * math.exp(-r * T)
             d1 = (math.log(S / K) + (r - q + 0.5 * sv ** 2) * T) / (sv * sqrt_T)
             d2 = d1 - sv * sqrt_T
-            # Prix call BSM
             call_mkt = fwd_S * _norm.cdf(d1) - fwd_K * _norm.cdf(d2)
-            # Bug #5 fix : utiliser le put OTM (parité) quand K > Forward
-            # K < Forward → call OTM → utiliser call directement (moins de valeur intrinsèque)
-            # K > Forward → put OTM → parité : put = call + fwd_K - fwd_S
             if K > S * math.exp((r - q) * T):
                 mkt_prices[i, j] = call_mkt + fwd_K - fwd_S
             else:
                 mkt_prices[i, j] = call_mkt
-            # Vega BSM (sensibilité du prix à σ) — sert à normaliser l'écart en prix
-            vega_norm[i, j] = max(fwd_S * sqrt_T * math.exp(-0.5 * d1 ** 2) / sqrt_2pi, 1e-4)
+            vega_norm[i, j]  = max(fwd_S * sqrt_T * math.exp(-0.5 * d1 ** 2) / sqrt_2pi, 1e-4)
+            w_sigma[i, j]    = 1.0 / (1.0 + sv)   # correction 6
 
     # Pré-calcul des exponentielles scalaires par tenor (hors objectif)
     tenor_fwd_S = np.array([S * math.exp(-q * T) for T in tenors])       # (n_T,)
@@ -499,61 +508,70 @@ def calibrate_heston(
 
             precomp = (d_u, g_u, coef_u, d_w, g_w, coef_w, w, None)
 
+            # ── Pénalité Feller : λ·max(0, σ_v² − 2κθ)² ──────────────────────
+            feller_viol = max(0.0, sigma_v ** 2 - 2.0 * kappa * theta)
+            penalty = 15.0 * feller_viol ** 2   # λ=15 : moins bloquant que 50
+
             total = 0.0
             n_pts = 0
             for i, T in enumerate(tenors):
                 if T <= 0:
                     continue
 
-                # Partie dynamique uniquement (exp + log sur T) — pas de sqrt ici
                 model_calls = _heston_call_vec(S, strikes, T, r, q, hp, _precomp=precomp)
 
-                # Parité call-put vectorisée
-                is_put       = strikes < tenor_atm_fwd[i]
+                # Parité : K > F → put OTM
+                is_put       = strikes > tenor_atm_fwd[i]
                 model_prices = np.where(
                     is_put,
                     model_calls + tenor_fwd_K[i] - tenor_fwd_S[i],
                     model_calls,
                 )
 
-                # Résidu ≈ Δiv au 1er ordre (sans brentq)
-                # Ne compter que les points réellement calibrés (vega_norm > 0)
                 valid = vega_norm[i] > 1e-5
                 if not np.any(valid):
                     continue
+                w_T = 1.0 / max(T, 0.05)   # pondération maturité
                 residuals = (
                     w_mat[i][valid]
+                    * w_sigma[i][valid]                              # correction 6
                     * (model_prices[valid] - mkt_prices[i][valid])
                     / vega_norm[i][valid]
                 )
-                total += float(np.sum(residuals ** 2))
+                total += w_T * float(np.sum(residuals ** 2))
                 n_pts += int(np.sum(valid))
 
-            return total / max(n_pts, 1)
+            return total / max(n_pts, 1) + penalty
         except Exception as e:
             print(f"[Heston] objectif exception: {e}")
             return 1e6
 
     # ── Bornes : [kappa, theta, sigma_v, rho, v0] ────────────────────────────
     bounds = [
-        (0.10, 15.0),    # kappa
+        (0.50, 25.0),    # kappa
         (0.01,  1.0),    # theta
-        (0.01,  2.0),    # sigma_v
-        (-0.95, 0.0),    # rho
-        (0.01,  1.0),    # v0
+        (0.05,  1.50),   # sigma_v — resserré [0.05, 1.5]
+        (-0.95, -0.30),  # rho     — skew marqué forcé
+        (0.01,  0.40),   # v0
     ]
+
+    # Point d'initialisation réaliste (centre de la zone crédible equity)
+    # theta=0.04 → vol_inf≈20%, v0=0.0625 → vol_init≈25%
+    x0 = np.array([4.0, 0.04, 0.70, -0.50, 0.0625])
 
     print("[Heston] Calibration — recherche globale (differential_evolution)...")
     result_de = differential_evolution(
         objective, bounds,
         seed=seed,
-        maxiter=50,          # 100→50 : demi-budget, la convergence est rapide
+        init='sobol',
+        x0=x0,
+        maxiter=80,
         tol=1e-5,
-        popsize=5,
+        popsize=8,
         mutation=(0.5, 1.5),
         recombination=0.7,
         workers=1,
-        polish=False,        # le raffinement L-BFGS-B est plus efficace
+        polish=False,
     )
 
     print(f"[Heston] DE terminé — résidu={math.sqrt(result_de.fun)*100:.4f}%")
@@ -711,24 +729,4 @@ def heston_simulate_paths(
     paths  = np.zeros((n_actual, len(observation_times)))
 
     for t in range(n_steps):
-        V_pos  = np.maximum(V, 0.0)
-        sqrt_V = np.sqrt(V_pos)
-        V      = V + kappa * (theta - V_pos) * dt + sigma_v * sqrt_V * sqrt_dt * ZV[t]
-        log_S  = log_S + (r - q - 0.5 * V_pos) * dt + sqrt_V * sqrt_dt * ZS[t]
-
-        if t in obs_set:
-            paths[:, obs_map[t]] = np.exp(log_S)
-
-    return observation_times, paths
-
-
-# ─── Paramètres par défaut (desk) ─────────────────────────────────────────────
-
-DEFAULT_HESTON = HestonParams(
-    kappa=2.0,
-    theta=0.04,    # vol long terme 20%
-    sigma_v=0.30,
-    rho=-0.70,
-    v0=0.04,       # vol initiale 20%
-)
-
+        V_pos  = np.maximum(V, 0.0

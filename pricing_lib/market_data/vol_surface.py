@@ -31,7 +31,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 from bs4 import BeautifulSoup
-from scipy.interpolate import RectBivariateSpline
+from scipy.interpolate import RectBivariateSpline, PchipInterpolator
 from scipy.optimize import brentq
 from scipy.stats import norm
 
@@ -359,6 +359,55 @@ def implied_vol(
         return None
 
 
+# ─── Interpolation PCHIP de la surface ───────────────────────────────────────
+
+def _interpolate_vol_surface(
+    grid_raw: pd.DataFrame,
+    K_lo: float,
+    K_hi: float,
+) -> pd.DataFrame:
+    """
+    Interpole σ_IV(T, K) sur la bande [K_lo, K_hi].
+    Passe 1 : PCHIP en K par maturité.
+    Passe 2 : PCHIP en T par strike.
+    Passe 3 : ffill/bfill pour les bords résiduels.
+    Passe 4 : smoothing léger [0.25, 0.5, 0.25] en K.
+    """
+    band = grid_raw.loc[
+        :, (grid_raw.columns >= K_lo) & (grid_raw.columns <= K_hi)
+    ].copy()
+
+    K_all = band.columns.to_numpy(dtype=float)
+    T_all = band.index.to_numpy(dtype=float)
+
+    for t in T_all:
+        row = band.loc[t]
+        valid = row.notna()
+        if valid.sum() < 2:
+            continue
+        interp = PchipInterpolator(K_all[valid.values], row[valid].values, extrapolate=False)
+        missing = ~valid.values
+        if missing.any():
+            band.loc[t, K_all[missing]] = np.clip(interp(K_all[missing]), 0.01, 5.0)
+
+    for k in K_all:
+        col = band[k]
+        valid = col.notna()
+        if valid.sum() < 2:
+            continue
+        interp = PchipInterpolator(T_all[valid.values], col[valid].values, extrapolate=False)
+        missing = ~valid.values
+        if missing.any():
+            band.loc[T_all[missing], k] = np.clip(interp(T_all[missing]), 0.01, 5.0)
+
+    band = band.ffill(axis=0).bfill(axis=0).ffill(axis=1).bfill(axis=1)
+
+    arr = band.to_numpy(dtype=float)
+    s = arr.copy()
+    s[:, 1:-1] = 0.5 * arr[:, 1:-1] + 0.25 * arr[:, :-2] + 0.25 * arr[:, 2:]
+    return pd.DataFrame(s, index=band.index, columns=band.columns)
+
+
 # ─── VolSurface ───────────────────────────────────────────────────────────────
 
 class VolSurface:
@@ -461,12 +510,17 @@ class VolSurface:
                 else:
                     continue
 
+            # Floor intrinsèque
+            flag_int = 1 if opt_type == "C" else -1
+            intrinsic = max(flag_int * (spot * math.exp(-q * T) - K * math.exp(-r * T)), 0.0)
+            price = max(price, intrinsic + 5e-4)
+
             # Calcule VI
             iv = implied_vol(price, spot, K, T, r, q, opt_type)
             if iv is None:
                 continue
 
-            records.append({"T": T, "K": K, "iv": iv})
+            records.append({"T": round(T, 6), "K": K, "iv": iv})
 
         if not records:
             raise ValueError("Surface vide — aucune vol implicite calculée.")
@@ -479,21 +533,23 @@ class VolSurface:
         if len(tenors_raw) < 2 or len(strikes_raw) < 2:
             raise ValueError(f"Surface trop pauvre ({len(tenors_raw)} tenor(s), {len(strikes_raw)} strike(s))")
 
-        # Grid avec interpolation
+        # Pivot : moyenne C+P par (T, K)
         grid = ivdf.groupby(["T", "K"])["iv"].mean().unstack("K")
-        grid = grid.reindex(index=tenors_raw).ffill()
-        grid = grid.T.reindex(strikes_raw).ffill().bfill().T
-        grid = grid.ffill().bfill()
 
-        vols_array = grid.to_numpy(dtype=float)
+        # Interpolation PCHIP sur bande [0.70S, 1.30S]
+        K_lo = 0.70 * spot
+        K_hi = 1.30 * spot
+        grid_filled = _interpolate_vol_surface(grid, K_lo=K_lo, K_hi=K_hi)
+
+        vols_array = grid_filled.to_numpy(dtype=float)
 
         return cls(
             valuation_date=today,
             spot=spot,
             r=r,
             q=q,
-            tenors=np.array(sorted(grid.index.tolist())),
-            strikes=np.array(sorted(grid.columns.tolist())),
+            tenors=np.array(sorted(grid_filled.index.tolist())),
+            strikes=np.array(sorted(grid_filled.columns.tolist())),
             vols=vols_array,
         )
 
@@ -790,72 +846,4 @@ def build_surface(ticker: str, spot: float) -> VolSurface:
     return surf
 
 
-def compute_dupire_surface(
-    surf: VolSurface,
-    tenors: Optional[np.ndarray] = None,
-    strikes: Optional[np.ndarray] = None,
-) -> pd.DataFrame:
-    """Compute local vol surface via Dupire."""
-    if tenors is None:
-        tenors = surf.tenors
-    if strikes is None:
-        strikes = surf.strikes
-
-    records = []
-    for T in tenors:
-        for K in strikes:
-            loc_vol = dupire_local_vol(surf, T, K)
-            records.append({"T": T, "K": K, "local_vol": loc_vol})
-
-    return pd.DataFrame(records)
-
-
-# ─── helpers ───────────────────────────────────────────────────────────────────
-
-def _pf(s) -> Optional[float]:
-    """Parse float from string."""
-    if s is None:
-        return None
-    s = str(s).strip().replace(",", ".")
-    if s in ("-", "", "—", "N/A"):
-        return None
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-
-def _third_friday(year: int, month: int) -> date:
-    """
-    Retourne le 3ème vendredi du mois — date d'échéance standard Euronext
-    pour les options sur actions (STO).
-    """
-    weeks = calendar.monthcalendar(year, month)   # listes [Lun..Dim]
-    # index 4 = vendredi ; on filtre les semaines où vendredi ≠ 0
-    fridays = [w[4] for w in weeks if w[4] != 0]
-    return date(year, month, fridays[2])          # 3ème vendredi
-
-
-def _parse_maturity_to_yyyy_mm(s: str) -> str:
-    """Parse maturity label → YYYY-MM."""
-    s = s.strip()
-
-    if "-" in s:
-        parts = s.split("-")
-        if len(parts) == 3:
-            try:
-                day, month, year = parts
-                return f"{year}-{month.zfill(2)}"
-            except (ValueError, TypeError):
-                pass
-
-    parts = s.split()
-    if len(parts) >= 2:
-        month_str = parts[0][:3].capitalize()
-        year = parts[-1]
-        month_num = _MONTH_FR.get(month_str, "??")
-        return f"{year}-{month_num}"
-
-    return s
-
-
+def comp
