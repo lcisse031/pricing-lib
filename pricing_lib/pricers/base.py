@@ -43,7 +43,8 @@ class PricingResult:
     fair_participation: Optional[float]        = None
     cashflows:          Optional[pd.DataFrame] = None
     probabilities:      Optional[pd.DataFrame] = None
-    bs_params:          Optional[Dict]         = None   # paramètres BS utilisés (analytique)
+    bs_params:          Optional[Dict]         = None
+    mc_stderr:          Optional[float]        = None   # erreur standard MC du prix   # paramètres BS utilisés (analytique)
 
     def __repr__(self) -> str:
         sep = "═" * 55
@@ -54,6 +55,9 @@ class PricingResult:
             sep,
             f"  Prix              : {self.price:>10.4f}",
         ]
+        if self.mc_stderr is not None:
+            lines.append(f"  Erreur std MC     : ±{self.mc_stderr:>9.4f}  "
+                         f"(IC95% ±{1.96*self.mc_stderr:.4f})")
         if self.fair_coupon is not None:
             lines.append(f"  Coupon fair       : {self.fair_coupon*100:>9.3f}% p.a.")
         if self.fair_participation is not None:
@@ -63,21 +67,42 @@ class PricingResult:
             p = self.bs_params
             lines.append(f"  {'─'*51}")
             lines.append(f"  Paramètres Black-Scholes :")
-            lines.append(f"    {'S':<6} : {p.get('S', 0):>10.4f}    (spot)")
-            lines.append(f"    {'K':<6} : {p.get('K', 0):>10.4f}    (strike)")
-            lines.append(f"    {'T':<6} : {p.get('T', 0):>10.6f}    (années)")
-            lines.append(f"    {'r':<6} : {p.get('r', 0):>10.4%}    (taux OIS)")
-            lines.append(f"    {'q':<6} : {p.get('q', 0):>10.4%}    (div. continu)")
-            lines.append(f"    {'σ':<6} : {p.get('sigma', 0):>10.4%}    ({p.get('vol_type', 'vol')})")
-            lines.append(f"    {'F':<6} : {p.get('F', 0):>10.4f}    (forward)")
+            lines.append(f"    {'S':<6} : {p.get('S', 0):>10.4f}    ")
+            lines.append(f"    {'K':<6} : {p.get('K', 0):>10.4f}    ")
+            lines.append(f"    {'T':<6} : {p.get('T', 0):>10.6f}    ")
+            lines.append(f"    {'r':<6} : {p.get('r', 0):>10.4%}    ")
+            lines.append(f"    {'q':<6} : {p.get('q', 0):>10.4%}    ")
+            lines.append(f"    {'σ':<6} : {p.get('sigma', 0):>10.4%}    ")
             if 'd1' in p:
                 lines.append(f"    {'d1':<6} : {p.get('d1', 0):>10.6f}")
                 lines.append(f"    {'d2':<6} : {p.get('d2', 0):>10.6f}")
 
+        # Bloc « Prix intermédiaires » (bump & reprice centré) — affiché
+        # uniquement quand les clés p_* sont présentes (AL exotiques + tout MC).
+        _PRICE_BLOCK = (
+            ("p_0",        "p_0"),
+            ("p_S_up",     "p_S_up      ← S + dS"),
+            ("p_S_down",   "p_S_down    ← S − dS"),
+            ("p_vol_up",   "p_vol_up    ← σ/v + dσ"),
+            ("p_vol_down", "p_vol_down  ← σ/v − dσ"),
+            ("p_r_up",     "p_r_up      ← r + dr"),
+            ("p_r_down",   "p_r_down    ← r − dr"),
+            ("p_T_up",     "p_T_up      ← T + dT"),
+            ("p_T_down",   "p_T_down    ← T − dT"),
+        )
+        if "p_0" in self.greeks:
+            lines.append(f"  {'─'*51}")
+            lines.append("  Prix intermédiaires (bump & reprice centré) :")
+            for key, label in _PRICE_BLOCK:
+                if key in self.greeks:
+                    lines.append(f"    {label:<24} : {self.greeks[key]:>12.6f}")
+
         lines.append(f"  {'─'*51}")
+        _GREEK_KEYS = ("delta", "gamma", "vega", "theta", "rho")
         lines.append(f"  Greeks :")
-        for k, v in self.greeks.items():
-            lines.append(f"    {k:>6} : {v:+.6f}")
+        for k in _GREEK_KEYS:
+            if k in self.greeks:
+                lines.append(f"    {k:>6} : {self.greeks[k]:+.6f}")
 
         if self.cashflows is not None:
             lines.append(f"  {'─'*51}")

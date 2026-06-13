@@ -40,6 +40,18 @@ from pricing_lib.pricers.base import PricingResult
 from pricing_lib.pricers.mc import get_heston_params
 
 
+def _fwd_rate(ois_curve, T: float) -> float:
+    """
+    Taux forward OIS continu jusqu'à T : r_T = −ln(df(T))/T.
+
+    Utilisé comme drift de simulation des autocalls (cohérent avec les pricers
+    mono-maturité). Avec une courbe décalée (_BumpedMarket), r_T se décale aussi
+    → le bump de taux touche drift ET actualisation (rho complet).
+    """
+    T = max(float(T), 1e-6)
+    return -math.log(max(ois_curve.df_tau(T), 1e-12)) / T
+
+
 # ─── Helpers dates ────────────────────────────────────────────────────────────
 
 def _observation_dates(start: date, freq_months: int, maturity_months: int):
@@ -121,7 +133,7 @@ class PhoenixPricer:
         """Simule les trajectoires — retourne paths (n_paths, n_periods)."""
         _, paths = heston_simulate_paths(
             S=self.S0,
-            r=self.snap.r,
+            r=_fwd_rate(self.snap.ois_curve, self.T),   # drift = r_T (forward à maturité)
             q=self.snap.q,
             T=self.T,
             params=self.params,
@@ -232,50 +244,84 @@ class PhoenixPricer:
 
     # ── Greeks (delta, gamma, vega) ──────────────────────────────────────────
 
-    def _compute_greeks(self, price_0: float) -> dict:
+    def _compute_greeks(self, price_0: float, fair_coupon: float = None) -> dict:
         """
-        Sensibilités par différences finies (re-simulation à n_paths//8).
-        Delta & Gamma : choc spot ±1 %.
-        Vega          : choc vol initiale +1 pt (v0, theta).
-        Rho / Theta   : 0 (approximation).
-        Les sous-pricers appellent _compute_repl/_compute_mc directement
-        pour éviter la récursion.
+        Sensibilités par différences finies CENTRÉES (re-simulation à n_paths//8,
+        même seed), convention unifiée avec le reste de la lib + bloc p_*.
+        Delta / Gamma : S ± dS.
+        Vega          : shift parallèle ±1 pt de vol sur √v0 ET √θ.
+        Rho           : ± dr via courbe OIS décalée (_BumpedMarket).
+        Theta         : ± 1 jour calendaire (start_date ∓ 1j).
+
+        Mode AL : le coupon_fair est figé (paramètre fair_coupon) et les
+        bumps sont pricés en MC — sinon chaque bump reprice en AL et donne
+        toujours ~100 %, ce qui annule delta/gamma.
         """
+        from datetime import timedelta
+        from pricing_lib.risk.greeks import _assemble, _BumpedMarket
+
         n_bump = max(self.n_paths // 8, 500)
         dS     = self.S0 * 0.01
-        sig0   = math.sqrt(self.params.v0)
-        d_var  = (sig0 + 0.01) ** 2 - self.params.v0
+        dvol   = 0.01      # 1 point de vol
+        dr     = 0.0001
 
-        def _sub_price(S0_new, params_new=None) -> float:
-            p = params_new or self.params
+        # Mode AL : on fixe le coupon et on passe en MC pour les bumps
+        coupon_b = fair_coupon if (self.mode == "AL" and fair_coupon is not None) \
+                   else self.coupon
+
+        def _sub_price(S0_new, params_new=None, snap_new=None, start_new=None) -> float:
+            p  = params_new if params_new is not None else self.params
+            sn = snap_new   if snap_new   is not None else self.snap
+            sd = start_new  if start_new  is not None else self.start_date
             sub = PhoenixPricer(
-                self.snap, n_bump, self.start_date, S0_new,
+                sn, n_bump, sd, S0_new,
                 self.barrier_coupon, self.barrier_recall, self.capital_barrier,
                 self.freq_months, self.maturity_months, self.kg, self.autocall_start,
-                mode=self.mode, coupon=self.coupon, params=p, seed=self.seed,
+                mode="MC", coupon=coupon_b, params=p, seed=self.seed,
             )
-            paths_sub = sub._simulate()
-            if sub.mode == "MC":
-                return sub._compute_mc(paths_sub).price
-            return sub._compute_repl(paths_sub).price
+            return sub._compute_mc(sub._simulate()).price
 
-        greeks = {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0}
-        try:
-            p_up = _sub_price(self.S0 + dS)
-            p_dn = _sub_price(self.S0 - dS)
-            greeks["delta"] = round((p_up - p_dn) / (2 * dS), 6)
-            greeks["gamma"] = round((p_up - 2 * price_0 + p_dn) / dS ** 2, 6)
-        except Exception:
-            pass
-        try:
-            bumped = _dc_replace(self.params,
-                                 v0=self.params.v0 + d_var,
-                                 theta=self.params.theta + d_var)
-            p_vega = _sub_price(self.S0, params_new=bumped)
-            greeks["vega"] = round((p_vega - price_0) / 0.01, 6)
-        except Exception:
-            pass
-        return greeks
+        def _safe(fn, fallback):
+            try:
+                return float(fn())
+            except Exception:
+                return fallback
+
+        # Prix de base MC (AL : price_0 ≈ 100 % → on reprice en MC à coupon figé)
+        # p_0 du bloc Greeks recalculé AU MÊME seed/n_bump que les chocs
+        # (sinon gamma contaminé par le décalage de trajectoires). Le prix
+        # affiché du produit reste price_0 (pleine résolution).
+        p0 = _safe(lambda: _sub_price(self.S0), price_0)
+
+        # Spot ± dS (delta, gamma)
+        p_S_up   = _safe(lambda: _sub_price(self.S0 + dS), p0)
+        p_S_down = _safe(lambda: _sub_price(self.S0 - dS), p0)
+
+        # Vol : shift parallèle ± dvol points sur √v0 et √θ, reconvertis en variance
+        vol_v0 = math.sqrt(max(self.params.v0,    0.0))
+        vol_th = math.sqrt(max(self.params.theta, 0.0))
+        par_up = _dc_replace(self.params, v0=(vol_v0 + dvol) ** 2,
+                                          theta=(vol_th + dvol) ** 2)
+        par_dn = _dc_replace(self.params, v0=max(vol_v0 - dvol, 1e-4) ** 2,
+                                          theta=max(vol_th - dvol, 1e-4) ** 2)
+        p_vol_up   = _safe(lambda: _sub_price(self.S0, params_new=par_up), p0)
+        p_vol_down = _safe(lambda: _sub_price(self.S0, params_new=par_dn), p0)
+
+        # Taux ± dr (courbe OIS décalée, forme préservée)
+        p_r_up   = _safe(lambda: _sub_price(self.S0, snap_new=_BumpedMarket(self.snap, rate_bump=+dr)), p0)
+        p_r_down = _safe(lambda: _sub_price(self.S0, snap_new=_BumpedMarket(self.snap, rate_bump=-dr)), p0)
+
+        # Temps ± 1 jour : +1j = maturité plus courte (p_T_down) ; −1j = plus longue (p_T_up)
+        p_T_down = _safe(lambda: _sub_price(self.S0, start_new=self.start_date + timedelta(days=1)), p0)
+        p_T_up   = _safe(lambda: _sub_price(self.S0, start_new=self.start_date - timedelta(days=1)), p0)
+
+        return _assemble(
+            p0,
+            p_S_up, p_S_down, dS,
+            p_vol_up, p_vol_down, 2.0 * dvol, 0.01,
+            p_r_up, p_r_down, 2.0 * dr,
+            p_T_up, p_T_down, 2.0,    # ± 1 jour → dénominateur 2 jours
+        )
 
     # ── Mode AL ─────────────────────────────────────────────────────────────
 
@@ -316,7 +362,7 @@ class PhoenixPricer:
             "PV_coupon":  (np.array(p_coupon) * coupon_fair * dfs).round(6),
         })
 
-        greeks = self._compute_greeks(price) if self.compute_greeks \
+        greeks = self._compute_greeks(price, fair_coupon=coupon_fair) if self.compute_greeks \
             else {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0}
 
         return PricingResult(
@@ -477,7 +523,7 @@ class AthenaPricer:
 
     def price(self) -> PricingResult:
         _, paths = heston_simulate_paths(
-            S=self.S0, r=self.snap.r, q=self.snap.q, T=self.T,
+            S=self.S0, r=_fwd_rate(self.snap.ois_curve, self.T), q=self.snap.q, T=self.T,
             params=self.params, n_paths=self.n_paths,
             observation_times=self.obs_taus,
             antithetic=self.antithetic, seed=self.seed,
@@ -542,47 +588,78 @@ class AthenaPricer:
 
     # ── Greeks (delta, gamma, vega) ──────────────────────────────────────────
 
-    def _compute_greeks(self, price_0: float) -> dict:
+    def _compute_greeks(self, price_0: float, fair_coupon: float = None) -> dict:
+        """
+        Différences finies CENTRÉES, convention unifiée + bloc p_* (cf.
+        PhoenixPricer._compute_greeks). Delta/Gamma sur S, Vega = shift parallèle
+        ±1 pt de vol (√v0, √θ), Rho via courbe décalée, Theta ±1 jour.
+        Mode AL : coupon_fair figé, bumps pricés en MC.
+        """
+        from datetime import timedelta
+        from pricing_lib.risk.greeks import _assemble, _BumpedMarket
+
         n_bump = max(self.n_paths // 8, 500)
         dS     = self.S0 * 0.01
-        sig0   = math.sqrt(self.params.v0)
-        d_var  = (sig0 + 0.01) ** 2 - self.params.v0
+        dvol   = 0.01
+        dr     = 0.0001
 
-        def _sub_price(S0_new, params_new=None) -> float:
-            p = params_new or self.params
+        coupon_b = fair_coupon if (self.mode == "AL" and fair_coupon is not None) \
+                   else self.coupon
+
+        def _sub_price(S0_new, params_new=None, snap_new=None, start_new=None) -> float:
+            p  = params_new if params_new is not None else self.params
+            sn = snap_new   if snap_new   is not None else self.snap
+            sd = start_new  if start_new  is not None else self.start_date
             sub = AthenaPricer(
-                self.snap, n_bump, self.start_date, S0_new,
+                sn, n_bump, sd, S0_new,
                 self.barrier_recall, self.capital_barrier,
                 self.freq_months, self.maturity_months, self.kg,
-                mode=self.mode, coupon=self.coupon, params=p, seed=self.seed,
+                mode="MC", coupon=coupon_b, params=p, seed=self.seed,
             )
             _, paths_sub = heston_simulate_paths(
-                S=S0_new, r=self.snap.r, q=self.snap.q, T=sub.T,
+                S=S0_new, r=_fwd_rate(sn.ois_curve, sub.T), q=sn.q, T=sub.T,
                 params=p, n_paths=n_bump,
                 observation_times=sub.obs_taus,
                 antithetic=sub.antithetic, seed=sub.seed,
             )
-            if sub.mode == "MC":
-                return sub._compute_mc(paths_sub).price
-            return sub._compute_repl(paths_sub).price
+            return sub._compute_mc(paths_sub).price
 
-        greeks = {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0}
-        try:
-            p_up = _sub_price(self.S0 + dS)
-            p_dn = _sub_price(self.S0 - dS)
-            greeks["delta"] = round((p_up - p_dn) / (2 * dS), 6)
-            greeks["gamma"] = round((p_up - 2 * price_0 + p_dn) / dS ** 2, 6)
-        except Exception:
-            pass
-        try:
-            bumped = _dc_replace(self.params,
-                                 v0=self.params.v0 + d_var,
-                                 theta=self.params.theta + d_var)
-            p_vega = _sub_price(self.S0, params_new=bumped)
-            greeks["vega"] = round((p_vega - price_0) / 0.01, 6)
-        except Exception:
-            pass
-        return greeks
+        def _safe(fn, fallback):
+            try:
+                return float(fn())
+            except Exception:
+                return fallback
+
+        # p_0 du bloc Greeks recalculé AU MÊME seed/n_bump que les chocs
+        # (sinon gamma contaminé par le décalage de trajectoires). Le prix
+        # affiché du produit reste price_0 (pleine résolution).
+        p0 = _safe(lambda: _sub_price(self.S0), price_0)
+
+        p_S_up   = _safe(lambda: _sub_price(self.S0 + dS), p0)
+        p_S_down = _safe(lambda: _sub_price(self.S0 - dS), p0)
+
+        vol_v0 = math.sqrt(max(self.params.v0,    0.0))
+        vol_th = math.sqrt(max(self.params.theta, 0.0))
+        par_up = _dc_replace(self.params, v0=(vol_v0 + dvol) ** 2,
+                                          theta=(vol_th + dvol) ** 2)
+        par_dn = _dc_replace(self.params, v0=max(vol_v0 - dvol, 1e-4) ** 2,
+                                          theta=max(vol_th - dvol, 1e-4) ** 2)
+        p_vol_up   = _safe(lambda: _sub_price(self.S0, params_new=par_up), p0)
+        p_vol_down = _safe(lambda: _sub_price(self.S0, params_new=par_dn), p0)
+
+        p_r_up   = _safe(lambda: _sub_price(self.S0, snap_new=_BumpedMarket(self.snap, rate_bump=+dr)), p0)
+        p_r_down = _safe(lambda: _sub_price(self.S0, snap_new=_BumpedMarket(self.snap, rate_bump=-dr)), p0)
+
+        p_T_down = _safe(lambda: _sub_price(self.S0, start_new=self.start_date + timedelta(days=1)), p0)
+        p_T_up   = _safe(lambda: _sub_price(self.S0, start_new=self.start_date - timedelta(days=1)), p0)
+
+        return _assemble(
+            p0,
+            p_S_up, p_S_down, dS,
+            p_vol_up, p_vol_down, 2.0 * dvol, 0.01,
+            p_r_up, p_r_down, 2.0 * dr,
+            p_T_up, p_T_down, 2.0,
+        )
 
     # ── Mode AL ─────────────────────────────────────────────────────────────
 
@@ -627,7 +704,7 @@ class AthenaPricer:
                           * np.arange(1, n_periods + 1) * coupon_fair).round(6),
         })
 
-        greeks = self._compute_greeks(price) if self.compute_greeks \
+        greeks = self._compute_greeks(price, fair_coupon=coupon_fair) if self.compute_greeks \
             else {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0}
 
         return PricingResult(

@@ -102,16 +102,78 @@ def Backtest(
     )
     return engine.run()
 
-call = PositionSpec(
+if __name__ == "__main__":
+    '''call = PositionSpec(
         product_id   = 'CALL_GLE_100',
         ticker       = 'GLE',
         product_type = 'call',
-        spot         = 22.50,
+        spot         = 20.68,
         start_date   = '02/01/2023',
         maturity     = '3M',
         nominal      = 100_000,
         mode         = 'AL',
-        params       = {'strike': 22.50},
+        params       = {'strike': 20.685},
+    )
+    print(Backtest(call, freq='daily').positions.head(100))'''
+
+
+    # ── Produit 1 : Call vanilla GLE ─────────────────────────────────────────────
+    call = PositionSpec(
+        product_id   = 'CALL_GLE',
+        ticker       = 'GLE',
+        product_type = 'call',
+        spot         = 20.68,
+        start_date   = '02/01/2023',
+        maturity     = '6M',
+        nominal      = 100_000,
+        mode         = 'AL',
+        params       = {'strike': 20.68},
     )
 
-print(Backtest(call, freq='daily').positions.head())    
+    # ── Produit 2 : Put GLE (couverture) ─────────────────────────────────────────
+    put = PositionSpec(
+        product_id   = 'PUT_GLE',
+        ticker       = 'GLE',
+        product_type = 'put',
+        spot         = 20.68,
+        start_date   = '02/01/2023',
+        maturity     = '6M',
+        nominal      = 50_000,
+        mode         = 'AL',
+        params       = {'strike': 18.50},   # put OTM à ~90%
+    )
+
+    # ── Produit 3 : Phoenix autocall MC ──────────────────────────────────────────
+    phoenix = PositionSpec(
+        product_id   = 'PHOENIX_GLE',
+        ticker       = 'GLE',
+        product_type = 'phoenix',
+        spot         = 20.68,
+        start_date   = '02/01/2023',
+        maturity     = '12M',
+        nominal      = 200_000,
+        mode         = 'MC',
+        n_paths      = 5_000,
+        seed         = 42,
+        params       = {
+            'barrier_coupon'  : 0.70,   # coupon servi si spot > 70% S0
+            'barrier_recall'  : 1.00,   # rappel anticipé si spot > 100% S0
+            'capital_barrier' : 0.60,   # protection capital si spot > 60% S0
+            'freq_months'     : 3,      # observation trimestrielle
+            'coupon'          : 0.08,   # 8% annuel
+            'kg'              :'no',
+            'autocall_start'  : 1,
+        },
+    )
+
+    # ── Backtest portefeuille ─────────────────────────────────────────────────────
+    results = Backtest(
+        [call, put, phoenix],
+        start_date = '02/01/2023',
+        end_date   = '30/06/2023',
+        freq       = 'daily',
+    )
+
+    print(results.portfolio.head(100))
+
+    print(results.positions.head(100))

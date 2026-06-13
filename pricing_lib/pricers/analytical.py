@@ -52,7 +52,8 @@ from pricing_lib.pricers.core.pdts import (
 from pricing_lib.market_data.market_snapshot import MarketSnapshot
 from pricing_lib.market_data.vol_surface import dupire_local_vol
 from pricing_lib.pricers.base import PricingResult
-from pricing_lib.pricers.greeks import compute_greeks
+from pricing_lib.risk.greeks import compute_greeks_bs, compute_greeks_fd_vol
+
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -184,6 +185,14 @@ class AnalyticalPricer:
     def q(self) -> float:
         return self.snap.q
 
+    def _rT(self, T: float) -> float:
+        """Taux forward OIS continu jusqu'à T : r_T = −ln(df(T))/T.
+        Cohérence drift/actualisation : exp(−r_T·T) = df_OIS(T) exactement
+        (et bump de r_T → drift ET actualisation, rho complet)."""
+        T = max(float(T), 1e-6)
+        ois = self.snap.ois_curve
+        return -math.log(max(ois.df_tau(T), 1e-12)) / T
+
     def _iv(self, T: float, K: float) -> float:
         """Vol IMPLICITE de marché σ_IV(T, K) — interpolation directe de la surface.
         À utiliser pour les vanilles (call, put, warrant).
@@ -204,29 +213,40 @@ class AnalyticalPricer:
         F = self.S * math.exp((self.r - self.q) * T)
         return dupire_local_vol(self.snap.vol_surface, T, F)
 
-    def _result(
-        self, price: float, price_fn, S, r, q, sigma, T,
-        product: str, model: str = "analytical",
-        K: float = None, vol_type: str = "σ_IV(T,K)", **kw
-    ) -> PricingResult:
-        greeks = compute_greeks(price_fn, price, S, r, q, sigma, T, **kw)
+    def _eff_sigma(self, T: float, K_lo: float, K_hi: float,
+                   n_t: int = 4, n_k: int = 5) -> float:
+        """
+        Vol locale EFFECTIVE pour les exotiques/barrières : RMS de σ_loc(t, K)
+        sur la bande de strikes [K_lo, K_hi] et le temps [0, T].
 
-        # Paramètres BS : calculés si K est fourni (vanilles), sinon ATM
+        Bien plus représentative qu'un point unique — un produit à barrière
+        dépend de la vol sur toute la plage de niveaux qu'il peut toucher, pas
+        seulement au strike. Sur surface plate, redonne la vol constante.
+        """
+        K_lo, K_hi = sorted((max(K_lo, 1e-6), max(K_hi, 1e-6)))
+        ts = np.linspace(T / n_t, T, max(n_t, 1))
+        ks = np.linspace(K_lo, K_hi, max(n_k, 1)) if K_hi > K_lo * 1.001 else np.array([K_lo])
+        var = [dupire_local_vol(self.snap.vol_surface, float(t), float(K)) ** 2
+               for t in ts for K in ks]
+        return math.sqrt(max(np.mean(var), 1e-8))
+
+    def _result(
+        self, price: float, greeks: dict, S, r, q, sigma, T,
+        product: str, model: str = "analytical",
+        K: float = None, vol_type: str = "σ_IV(T,K)",
+    ) -> PricingResult:
         K_ref = K if K is not None else S * math.exp((r - q) * T)
-        F     = S * math.exp((r - q) * T)
         if sigma > 0 and T > 0:
             d1 = (math.log(S / K_ref) + (r - q + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
             d2 = d1 - sigma * math.sqrt(T)
         else:
             d1 = d2 = float("nan")
-
         bs = {
             "S": S, "K": K_ref, "T": T,
             "r": r, "q": q, "sigma": sigma,
-            "F": F, "d1": d1, "d2": d2,
+            "d1": d1, "d2": d2,
             "vol_type": vol_type,
         }
-
         return PricingResult(
             price=round(price, 6),
             greeks=greeks,
@@ -238,109 +258,111 @@ class AnalyticalPricer:
 
     # ── Vanilles ─────────────────────────────────────────────────────────────
 
-    def call(self, K: float, T: float, ratio: float = 1.0) -> PricingResult:
+    def _vanilla_result(
+        self, flag: str, K: float, T: float, ratio: float, product: str
+    ) -> PricingResult:
+        """Construit PricingResult directement pour Call/Put/Warrant avec Greeks BS fermés."""
         sigma = self._iv(T, K)
-        S, r, q = self.S, self.r, self.q
-        price = warrant("c", S, K, T, r, q, sigma, ratio)
-        return self._result(price, lambda S, r, q, sigma, T: warrant("c", S, K, T, r, q, sigma, ratio),
-                            S, r, q, sigma, T, product="Call", K=K, vol_type="σ_IV(T,K)")
+        S, r, q = self.S, self._rT(T), self.q
+        price = warrant(flag, S, K, T, r, q, sigma, ratio)
+        if sigma > 0 and T > 0:
+            sqT = sigma * math.sqrt(T)
+            d1 = (math.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / sqT
+            d2 = d1 - sqT
+        else:
+            d1 = d2 = float("nan")
+        return PricingResult(
+            price=round(price, 6),
+            greeks=compute_greeks_bs(flag, S, K, T, r, q, sigma, ratio),
+            ticker=self.snap.ticker,
+            product=product,
+            model="analytical",
+            bs_params={
+                "S": S, "K": K, "T": T, "r": r, "q": q,
+                "sigma": sigma, "d1": d1, "d2": d2,
+                "vol_type": "σ_IV(T,K)",
+            },
+        )
+
+    def call(self, K: float, T: float, ratio: float = 1.0) -> PricingResult:
+        return self._vanilla_result("c", K, T, ratio, "Call")
 
     def put(self, K: float, T: float, ratio: float = 1.0) -> PricingResult:
-        sigma = self._iv(T, K)
-        S, r, q = self.S, self.r, self.q
-        price = warrant("p", S, K, T, r, q, sigma, ratio)
-        return self._result(price, lambda S, r, q, sigma, T: warrant("p", S, K, T, r, q, sigma, ratio),
-                            S, r, q, sigma, T, product="Put", K=K, vol_type="σ_IV(T,K)")
+        return self._vanilla_result("p", K, T, ratio, "Put")
 
     def warrant_product(self, flag: str, K: float, T: float, ratio: float = 1.0) -> PricingResult:
-        sigma = self._iv(T, K)
-        S, r, q = self.S, self.r, self.q
-        price = warrant(flag, S, K, T, r, q, sigma, ratio)
-        return self._result(price, lambda S, r, q, sigma, T: warrant(flag, S, K, T, r, q, sigma, ratio),
-                            S, r, q, sigma, T, product=f"Warrant {flag.upper()}", K=K, vol_type="σ_IV(T,K)")
+        return self._vanilla_result(flag, K, T, ratio, f"Warrant {flag.upper()}")
 
     # ── Catégorie 1 : structures pures ───────────────────────────────────────
 
     def bonus_certificate(self, X: float, B: float, T: float,
                           ratio: float = 1.0, barrier_hit: bool = False) -> PricingResult:
-        sigma = self._atm_sigma(T)
-        S, r, q = self.S, self.r, self.q
-        price = bonus_certificate(S, X, B, T, r, q, sigma, ratio, barrier_hit)
-        return self._result(
-            price,
-            lambda S, r, q, sigma, T: bonus_certificate(S, X, B, T, r, q, sigma, ratio, barrier_hit),
-            S, r, q, sigma, T, product="Bonus Certificate",
-        )
+        sigma = self._eff_sigma(T, B, X)
+        S, r, q = self.S, self._rT(T), self.q
+        pfn    = lambda S, r, q, sigma, T: bonus_certificate(S, X, B, T, r, q, sigma, ratio, barrier_hit)
+        price  = pfn(S, r, q, sigma, T)
+        greeks = compute_greeks_fd_vol(pfn, price, S, r, q, sigma, T)
+        return self._result(price, greeks, S, r, q, sigma, T, product="Bonus Certificate")
 
     def capped_bonus_certificate(self, X: float, B: float, cap: float, T: float,
                                   ratio: float = 1.0, barrier_hit: bool = False) -> PricingResult:
-        sigma = self._atm_sigma(T)
-        S, r, q = self.S, self.r, self.q
-        price = capped_bonus_certificate(S, X, B, cap, T, r, q, sigma, ratio, barrier_hit)
-        return self._result(
-            price,
-            lambda S, r, q, sigma, T: capped_bonus_certificate(S, X, B, cap, T, r, q, sigma, ratio, barrier_hit),
-            S, r, q, sigma, T, product="Capped Bonus Certificate",
-        )
+        sigma = self._eff_sigma(T, B, cap)
+        S, r, q = self.S, self._rT(T), self.q
+        pfn    = lambda S, r, q, sigma, T: capped_bonus_certificate(S, X, B, cap, T, r, q, sigma, ratio, barrier_hit)
+        price  = pfn(S, r, q, sigma, T)
+        greeks = compute_greeks_fd_vol(pfn, price, S, r, q, sigma, T)
+        return self._result(price, greeks, S, r, q, sigma, T, product="Capped Bonus Certificate")
 
     def reverse_bonus_certificate(self, X: float, B: float, T: float,
                                    ratio: float = 1.0, barrier_hit: bool = False) -> PricingResult:
-        sigma = self._atm_sigma(T)
-        S, r, q = self.S, self.r, self.q
-        S0 = S
-        price = reverse_bonus_certificate(S, S0, X, B, T, r, q, sigma, ratio, barrier_hit)
-        return self._result(
-            price,
-            lambda S, r, q, sigma, T: reverse_bonus_certificate(S, S0, X, B, T, r, q, sigma, ratio, barrier_hit),
-            S, r, q, sigma, T, product="Reverse Bonus Certificate",
-        )
+        sigma = self._eff_sigma(T, X, B)
+        S, r, q = self.S, self._rT(T), self.q
+        S0     = S
+        pfn    = lambda S, r, q, sigma, T: reverse_bonus_certificate(S, S0, X, B, T, r, q, sigma, ratio, barrier_hit)
+        price  = pfn(S, r, q, sigma, T)
+        greeks = compute_greeks_fd_vol(pfn, price, S, r, q, sigma, T)
+        return self._result(price, greeks, S, r, q, sigma, T, product="Reverse Bonus Certificate")
 
     def discount_certificate(self, X: float, T: float, ratio: float = 1.0) -> PricingResult:
-        sigma = self._sigma(T, X)
-        S, r, q = self.S, self.r, self.q
-        price = discount_certificate(S, X, T, r, q, sigma, ratio)
-        return self._result(
-            price,
-            lambda S, r, q, sigma, T: discount_certificate(S, X, T, r, q, sigma, ratio),
-            S, r, q, sigma, T, product="Discount Certificate",
-        )
+        sigma = self._eff_sigma(T, self.S, X)
+        S, r, q = self.S, self._rT(T), self.q
+        pfn    = lambda S, r, q, sigma, T: discount_certificate(S, X, T, r, q, sigma, ratio)
+        price  = pfn(S, r, q, sigma, T)
+        greeks = compute_greeks_fd_vol(pfn, price, S, r, q, sigma, T)
+        return self._result(price, greeks, S, r, q, sigma, T, product="Discount Certificate")
 
     def turbo_certificate(self, flag: str, X: float, B: float, T: float,
                            ratio: float = 1.0) -> PricingResult:
-        sigma = self._atm_sigma(T)
-        S, r, q = self.S, self.r, self.q
-        price = turbo_certificate(flag, S, X, B, T, r, q, sigma, ratio)
-        return self._result(
-            price,
-            lambda S, r, q, sigma, T: turbo_certificate(flag, S, X, B, T, r, q, sigma, ratio),
-            S, r, q, sigma, T, product=f"Turbo {'Call' if flag=='c' else 'Put'}",
-        )
+        sigma = self._eff_sigma(T, B, X)
+        S, r, q = self.S, self._rT(T), self.q
+        pfn    = lambda S, r, q, sigma, T: turbo_certificate(flag, S, X, B, T, r, q, sigma, ratio)
+        price  = pfn(S, r, q, sigma, T)
+        greeks = compute_greeks_fd_vol(pfn, price, S, r, q, sigma, T)
+        return self._result(price, greeks, S, r, q, sigma, T,
+                            product=f"Turbo {'Call' if flag=='c' else 'Put'}")
 
     def airbag_certificate(self, X: float, B: float, T: float,
                             ratio: float = 1.0) -> PricingResult:
-        sigma = self._atm_sigma(T)
-        S, r, q = self.S, self.r, self.q
-        part = implied_participation_airbag(S, S, X, B, T, r, q, sigma)
-        price = _airbag(S, X, B, T, r, q, sigma, part)
-        res = self._result(
-            price,
-            lambda S, r, q, sigma, T: _airbag(S, X, B, T, r, q, sigma, part),
-            S, r, q, sigma, T, product="Airbag Certificate",
-        )
+        sigma = self._eff_sigma(T, B, X)
+        S, r, q = self.S, self._rT(T), self.q
+        part   = implied_participation_airbag(S, S, X, B, T, r, q, sigma)
+        pfn    = lambda S, r, q, sigma, T: _airbag(S, X, B, T, r, q, sigma, part)
+        price  = pfn(S, r, q, sigma, T)
+        greeks = compute_greeks_fd_vol(pfn, price, S, r, q, sigma, T)
+        res    = self._result(price, greeks, S, r, q, sigma, T, product="Airbag Certificate")
         res.fair_participation = round(part, 6)
         return res
 
     def garantie_certificate(self, X: float, T: float,
                               nominal: float = 100.0, ratio: float = 1.0) -> PricingResult:
-        sigma = self._sigma(T, X)
-        S, r, q = self.S, self.r, self.q
-        part = implied_participation_garantie(S, S, X, T, r, q, sigma, nominal)
-        price = _garantie(S, X, T, r, q, sigma, part, nominal)
-        res = self._result(
-            price,
-            lambda S, r, q, sigma, T: _garantie(S, X, T, r, q, sigma, part, nominal),
-            S, r, q, sigma, T, product="Garantie Certificate",
-        )
+        sigma = self._eff_sigma(T, self.S, X)
+        S, r, q = self.S, self._rT(T), self.q
+        # Cible = nominal (capital garanti, prix au pair = nominal), PAS le spot.
+        part   = implied_participation_garantie(nominal, S, X, T, r, q, sigma, nominal)
+        pfn    = lambda S, r, q, sigma, T: _garantie(S, X, T, r, q, sigma, part, nominal)
+        price  = pfn(S, r, q, sigma, T)
+        greeks = compute_greeks_fd_vol(pfn, price, S, r, q, sigma, T)
+        res    = self._result(price, greeks, S, r, q, sigma, T, product="Garantie Certificate")
         res.fair_participation = round(part, 6)
         return res
 
@@ -358,8 +380,8 @@ class AnalyticalPricer:
         """RC avec fréquence de coupon. Retourne le coupon fair annualisé."""
         if start is None:
             start = self.snap.valuation_date
-        sigma = self._sigma(T, cap)
-        S, r, q = self.S, self.r, self.q
+        sigma = self._eff_sigma(T, cap, self.S)
+        S, r, q = self.S, self._rT(T), self.q
         snap = self.snap
 
         # Coupon fair : prix = 100% du nominal
@@ -371,10 +393,10 @@ class AnalyticalPricer:
         price  = _rc_price_with_freq(S, cap, T, r, q, sigma, nominal, coupon, freq, start, snap)
 
         # Greeks sur le prix
-        def _pfn(S, r, q, sigma, T):
+        def pfn(S, r, q, sigma, T):
             return _rc_price_with_freq(S, cap, T, r, q, sigma, nominal, coupon, freq, start, snap)
 
-        greeks = compute_greeks(_pfn, price, S, r, q, sigma, T)
+        greeks = compute_greeks_fd_vol(pfn, price, S, r, q, sigma, T)
         cf_df  = _cashflow_df(nominal, coupon, freq, T, start, snap)
 
         return PricingResult(
@@ -400,8 +422,8 @@ class AnalyticalPricer:
         """RC Plus Pro (knock-in put) avec fréquence de coupon."""
         if start is None:
             start = self.snap.valuation_date
-        sigma = self._sigma(T, cap)
-        S, r, q = self.S, self.r, self.q
+        sigma = self._eff_sigma(T, B, cap)
+        S, r, q = self.S, self._rT(T), self.q
         snap = self.snap
 
         from scipy.optimize import brentq
@@ -417,7 +439,7 @@ class AnalyticalPricer:
 
         coupon = brentq(price_at_coupon, 0.0, 2.0, xtol=1e-8)
 
-        def _pfn(S, r, q, sigma, T):
+        def pfn(S, r, q, sigma, T):
             from pricing_lib.pricers.core.pdts import _gbs, _barrier
             bond  = _bond_value(nominal, coupon, freq, T, start, snap)
             ratio = nominal / cap
@@ -426,8 +448,8 @@ class AnalyticalPricer:
             dop = 0.0 if barrier_hit else _barrier("pdo", S, cap, B, 0.0, T, r, b, sigma)
             return (bond - sp * ratio + dop * ratio) / nominal * 100.0
 
-        price  = _pfn(S, r, q, sigma, T)
-        greeks = compute_greeks(_pfn, price, S, r, q, sigma, T)
+        price  = pfn(S, r, q, sigma, T)
+        greeks = compute_greeks_fd_vol(pfn, price, S, r, q, sigma, T)
         cf_df  = _cashflow_df(nominal, coupon, freq, T, start, snap)
 
         return PricingResult(
@@ -443,40 +465,36 @@ class AnalyticalPricer:
     # ── Catégorie 3 : participation produits ──────────────────────────────────
 
     def outperformance_certificate(self, X: float, T: float, ratio: float = 1.0) -> PricingResult:
-        sigma = self._sigma(T, X)
-        S, r, q = self.S, self.r, self.q
-        part = implied_participation_outperformance(S, S, X, T, r, q, sigma)
-        price = _outperformance(S, X, T, r, q, sigma, part)
-        res = self._result(
-            price,
-            lambda S, r, q, sigma, T: _outperformance(S, X, T, r, q, sigma, part),
-            S, r, q, sigma, T, product="Outperformance Certificate",
-        )
+        sigma = self._eff_sigma(T, self.S, X)
+        S, r, q = self.S, self._rT(T), self.q
+        part   = implied_participation_outperformance(S, S, X, T, r, q, sigma)
+        pfn    = lambda S, r, q, sigma, T: _outperformance(S, X, T, r, q, sigma, part)
+        price  = pfn(S, r, q, sigma, T)
+        greeks = compute_greeks_fd_vol(pfn, price, S, r, q, sigma, T)
+        res    = self._result(price, greeks, S, r, q, sigma, T, product="Outperformance Certificate")
         res.fair_participation = round(part, 6)
         return res
 
     def sprint_certificate(self, X: float, cap: float, T: float, ratio: float = 1.0) -> PricingResult:
-        sigma = self._atm_sigma(T)
-        S, r, q = self.S, self.r, self.q
-        part = implied_participation_sprint(S, S, X, cap, T, r, q, sigma)
-        price = _sprint(S, X, cap, T, r, q, sigma, part)
-        res = self._result(
-            price,
-            lambda S, r, q, sigma, T: _sprint(S, X, cap, T, r, q, sigma, part),
-            S, r, q, sigma, T, product="Sprint Certificate",
-        )
+        sigma = self._eff_sigma(T, X, cap)
+        S, r, q = self.S, self._rT(T), self.q
+        part   = implied_participation_sprint(S, S, X, cap, T, r, q, sigma)
+        pfn    = lambda S, r, q, sigma, T: _sprint(S, X, cap, T, r, q, sigma, part)
+        price  = pfn(S, r, q, sigma, T)
+        greeks = compute_greeks_fd_vol(pfn, price, S, r, q, sigma, T)
+        res    = self._result(price, greeks, S, r, q, sigma, T, product="Sprint Certificate")
         res.fair_participation = round(part, 6)
         return res
 
     def twin_win_certificate(self, X: float, B: float, T: float, ratio: float = 1.0) -> PricingResult:
-        sigma = self._atm_sigma(T)
-        S, r, q = self.S, self.r, self.q
-        part = implied_participation_twin_win(S, S, X, B, T, r, q, sigma, bracket=(0., 5.))
-        price = _twin_win(S, X, B, T, r, q, sigma, part)
-        res = self._result(
-            price,
-            lambda S, r, q, sigma, T: _twin_win(S, X, B, T, r, q, sigma, part),
-            S, r, q, sigma, T, product="Twin Win Certificate",
-        )
+        sigma = self._eff_sigma(T, B, X)
+        S, r, q = self.S, self._rT(T), self.q
+        # Bracket élargi (y compris négatif) : sur fort dividende la participation
+        # fair peut sortir de [0, 5], il faut laisser le solveur respirer.
+        part   = implied_participation_twin_win(S, S, X, B, T, r, q, sigma, bracket=(-2., 20.))
+        pfn    = lambda S, r, q, sigma, T: _twin_win(S, X, B, T, r, q, sigma, part)
+        price  = pfn(S, r, q, sigma, T)
+        greeks = compute_greeks_fd_vol(pfn, price, S, r, q, sigma, T)
+        res    = self._result(price, greeks, S, r, q, sigma, T, product="Twin Win Certificate")
         res.fair_participation = round(part, 6)
         return res

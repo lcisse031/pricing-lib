@@ -90,11 +90,15 @@ def _barrier(flag: str, S: float, X: float, H: float, K: float,
               - X * np.exp(-r*T)    * N(eta*(x1-sqT)))
     B  = eta * (S * np.exp((b-r)*T) * N(eta*x2)
               - X * np.exp(-r*T)    * N(eta*(x2-sqT)))
-    C  = eta * (S * np.exp((b-r)*T) * HS**(2*(mu+1)) * N(phi*eta*y1)
-              - X * np.exp(-r*T)    * HS**(2*mu)       * N(phi*eta*(y1-sqT)))
-    D  = eta * (S * np.exp((b-r)*T) * HS**(2*(mu+1)) * N(phi*eta*y2)
-              - X * np.exp(-r*T)    * HS**(2*mu)       * N(phi*eta*(y2-sqT)))
-    E  = K * np.exp(-r*T) * (N(eta*(x2-sqT)) - HS**(2*mu) * N(eta*(y2-sqT)))
+    # Haug Table 4-1 : les termes "réfléchis" C,D et le rebate E utilisent η
+    # (down/up = `phi` ici), PAS φ (call/put = `eta`). Bug corrigé : l'argument
+    # des N de C,D était `phi*eta` (un η de trop) et E utilisait `eta` au lieu de
+    # `phi` → puts down/up-barrier mal pricés (les calls, η_code·1, étaient OK).
+    C  = eta * (S * np.exp((b-r)*T) * HS**(2*(mu+1)) * N(phi*y1)
+              - X * np.exp(-r*T)    * HS**(2*mu)       * N(phi*(y1-sqT)))
+    D  = eta * (S * np.exp((b-r)*T) * HS**(2*(mu+1)) * N(phi*y2)
+              - X * np.exp(-r*T)    * HS**(2*mu)       * N(phi*(y2-sqT)))
+    E  = K * np.exp(-r*T) * (N(phi*(x2-sqT)) - HS**(2*mu) * N(phi*(y2-sqT)))
     F_ = K * (HS**(mu+lam) * N(phi*z) + HS**(mu-lam) * N(phi*(z - 2*lam*sqT)))
 
     # --- 8 cases (Haug 2007 Table 4-1) ---

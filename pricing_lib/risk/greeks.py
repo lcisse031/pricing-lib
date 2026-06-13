@@ -1,263 +1,345 @@
 """
 pricing_lib/risk/greeks.py
 ─────────────────────────────────────────────────────────────────────────────
-Greeks par différences finies centrées.
+Moteur de Greeks unifié — spec « Pricing & Greeks ».
 
-FiniteDiffGreeks encapsule n'importe quel pricer callable et calcule
-Delta, Gamma, Vega, Theta, Rho par perturbation des paramètres.
+Trois voies, une seule convention de sortie :
 
-Compatible avec AnalyticalPricer et MonteCarloPricer (les deux retournent
-un objet avec un attribut .price).
+  1. compute_greeks_bs        — AL vanille (Call/Put/Warrant).
+                                100 % formules fermées Black-Scholes.
+                                Aucun bump, aucun bloc p_*.
 
-Usage
------
->>> from pricing_lib.pricers import AnalyticalPricer
->>> from pricing_lib.risk.greeks import FiniteDiffGreeks
->>>
->>> pricer  = AnalyticalPricer()
->>> greeks  = FiniteDiffGreeks(pricer, product, market)
->>> print(greeks.delta())
->>> print(greeks.all())
+  2. compute_greeks_fd_vol    — différences finies CENTRÉES, vol = paramètre σ.
+                                Utilisé par :
+                                  • AL exotiques (repricing déterministe)
+                                  • MC vanilles GBM (repricing simulé, seed fixe)
+                                price_fn(S, r, q, sigma, T) -> float
+
+  3. compute_greeks_fd_heston — différences finies CENTRÉES, vol = paramètres Heston.
+                                Utilisé par les exotiques MC (Heston).
+                                Vega = bump simultané v0 ET θ (choc de niveau de variance).
+                                price_fn(S, r, q, T, params) -> float
+
+Convention de différences finies (identique AL et MC, cf. décision projet) :
+
+    delta = (p_S_up   − p_S_down)  / (2·dS)
+    gamma = (p_S_up   − 2·p_0 + p_S_down) / dS²
+    vega  = (p_vol_up − p_vol_down)/ (2·dσ)          [voir note vega ci-dessous]
+    rho   = (p_r_up   − p_r_down)  / (2·dr)  · 1e-4   [pour +1 bp]
+    theta = (p_T_down − p_T_up)    / (2·dT_j)         [par jour calendaire]
+
+Le bloc de prix intermédiaires renvoyé (p_0, p_S_up, p_S_down, p_vol_up,
+p_vol_down, p_r_up, p_r_down, p_T_up, p_T_down) rend chaque Greek recomposable
+à la main → sortie auto-vérifiable.
+
+Note vega (unité homogène : +1 point de vol partout) :
+    • Vanilles (fd_vol)  : bump de σ de ±1 pt, vega × 0.01.
+    • Heston  (fd_heston): shift parallèle de ±1 pt de vol sur √v0 ET √θ
+                           (reconvertis en variance), vega × 0.01.
+      → Même unité que le vega vanille : sensibilité à un déplacement de +1
+        point du niveau de vol Heston (vol initiale et vol long terme).
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import replace
+from typing import Callable, Dict, Optional
 
-from ..market_data.market_snapshot import MarketSnapshot
+from scipy.stats import norm
 
+_N = norm.cdf      # fonction de répartition  N(·)
+_n = norm.pdf      # densité                  N'(·) = φ(·)
 
-# ─── résultat ────────────────────────────────────────────────────────────────
-
-@dataclass(frozen=True)
-class GreeksResult:
-    delta: float
-    gamma: float
-    vega:  float
-    theta: float
-    rho:   float
-
-    def __str__(self) -> str:
-        return (
-            f"Delta : {self.delta:>10.6f}\n"
-            f"Gamma : {self.gamma:>10.6f}\n"
-            f"Vega  : {self.vega:>10.4f}  (pour +1% vol)\n"
-            f"Theta : {self.theta:>10.4f}  (par jour calendaire)\n"
-            f"Rho   : {self.rho:>10.4f}  (pour +1bp taux)"
-        )
+_GREEK_KEYS = ("delta", "gamma", "vega", "theta", "rho")
+_PRICE_KEYS = (
+    "p_0",
+    "p_S_up", "p_S_down",
+    "p_vol_up", "p_vol_down",
+    "p_r_up", "p_r_down",
+    "p_T_up", "p_T_down",
+)
 
 
-# ─── FiniteDiffGreeks ────────────────────────────────────────────────────────
+# ─── 1. AL vanille — Greeks fermés Black-Scholes ─────────────────────────────
 
-class FiniteDiffGreeks:
+def compute_greeks_bs(
+    flag: str,
+    S: float, K: float, T: float,
+    r: float, q: float, sigma: float,
+    ratio: float = 1.0,
+) -> Dict[str, float]:
     """
-    Greeks par différences finies centrées sur le MarketSnapshot.
+    Greeks fermés d'une option vanille européenne (Garman-Kohlhagen, b = r − q).
 
-    Paramètres
-    ----------
-    pricer  : objet avec méthode .price(product, market[, model]) -> obj.price
-    product : produit à pricer
-    market  : MarketSnapshot de référence
-    model   : modèle optionnel (passé au pricer si fourni)
+    flag  : 'c' (call) | 'p' (put)
+    ratio : quotité / rapport de souscription, appliqué à tous les Greeks.
 
-    Bumps par défaut
-    ----------------
-    dS    : 0.1% de S     (Delta, Gamma)
-    dsig  : 1bp de vol    (Vega)
-    dT    : 1 jour        (Theta)
-    dr    : 1bp de taux   (Rho)
+    Conventions :
+        delta : ∂V/∂S
+        gamma : ∂²V/∂S²
+        vega  : ∂V/∂σ   pour +1 point de vol     (× 0.01)
+        theta : ∂V/∂t   par jour calendaire        (÷ 365)
+        rho   : ∂V/∂r   pour +1 bp de taux         (× 0.0001)
     """
+    flag = flag.lower()
+    if flag not in ("c", "p"):
+        raise ValueError(f"flag attendu 'c' ou 'p', reçu {flag!r}")
 
-    def __init__(
-        self,
-        pricer,
-        product,
-        market:  MarketSnapshot,
-        model    = None,
-        dS_frac: float = 0.001,
-        dsig:    float = 0.0001,
-        dT:      float = 1/365,
-        dr:      float = 0.0001,
-    ) -> None:
-        self._pricer  = pricer
-        self._product = product
-        self._market  = market
-        self._model   = model
-        self._dS_frac = dS_frac
-        self._dsig    = dsig
-        self._dT      = dT
-        self._dr      = dr
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0}
 
-    # ── interface publique ────────────────────────────────────────────────────
+    sqrtT = math.sqrt(T)
+    sqT   = sigma * sqrtT
+    d1    = (math.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / sqT
+    d2    = d1 - sqT
 
-    def delta(self) -> float:
-        dS  = self._market.spot * self._dS_frac
-        p_u = self._price(_bump_spot(self._market, +dS))
-        p_d = self._price(_bump_spot(self._market, -dS))
-        return (p_u - p_d) / (2 * dS)
+    eqT = math.exp(-q * T)
+    erT = math.exp(-r * T)
+    phi = _n(d1)
 
-    def gamma(self) -> float:
-        dS  = self._market.spot * self._dS_frac
-        p_u = self._price(_bump_spot(self._market, +dS))
-        p_0 = self._price(self._market)
-        p_d = self._price(_bump_spot(self._market, -dS))
-        return (p_u - 2 * p_0 + p_d) / dS**2
+    gamma = eqT * phi / (S * sqT)
+    vega  = S * eqT * phi * sqrtT
 
-    def vega(self, per_percent: bool = True) -> float:
-        p_u = self._price(_bump_vol(self._market, +self._dsig))
-        p_d = self._price(_bump_vol(self._market, -self._dsig))
-        raw = (p_u - p_d) / (2 * self._dsig)
-        return raw * 0.01 if per_percent else raw
+    if flag == "c":
+        delta = eqT * _N(d1)
+        theta = (-S * eqT * phi * sigma / (2.0 * sqrtT)
+                 - r * K * erT * _N(d2)
+                 + q * S * eqT * _N(d1))
+        rho = K * T * erT * _N(d2)
+    else:
+        delta = -eqT * _N(-d1)
+        theta = (-S * eqT * phi * sigma / (2.0 * sqrtT)
+                 + r * K * erT * _N(-d2)
+                 - q * S * eqT * _N(-d1))
+        rho = -K * T * erT * _N(-d2)
 
-    def theta(self) -> float:
-        prod = self._product
-        dT   = self._dT
-        try:
-            if hasattr(prod, "maturity"):
-                prod_bumped = _bump_product_maturity(prod, -dT)
-            else:
-                return float("nan")
-        except Exception:
-            return float("nan")
-        p_0 = self._price(self._market)
-        p_d = self._price_product(prod_bumped, self._market)
-        return (p_d - p_0) / dT
-
-    def rho(self, per_bp: bool = True) -> float:
-        p_u = self._price(_bump_rate(self._market, +self._dr))
-        p_d = self._price(_bump_rate(self._market, -self._dr))
-        raw = (p_u - p_d) / (2 * self._dr)
-        return raw * 0.0001 if per_bp else raw
-
-    def all(self) -> GreeksResult:
-        return GreeksResult(
-            delta = self.delta(),
-            gamma = self.gamma(),
-            vega  = self.vega(),
-            theta = self.theta(),
-            rho   = self.rho(),
-        )
-
-    # ── helpers ───────────────────────────────────────────────────────────────
-
-    def _price(self, market: MarketSnapshot) -> float:
-        return self._price_product(self._product, market)
-
-    def _price_product(self, product, market: MarketSnapshot) -> float:
-        if self._model is not None:
-            result = self._pricer.price(product, market, self._model)
-        else:
-            result = self._pricer.price(product, market)
-        return result.price
+    return {
+        "delta": round(ratio * delta,         6),
+        "gamma": round(ratio * gamma,         6),
+        "vega":  round(ratio * vega * 0.01,   6),
+        "theta": round(ratio * theta / 365.0, 6),
+        "rho":   round(ratio * rho * 0.0001,  6),
+    }
 
 
-# ─── bump helpers ─────────────────────────────────────────────────────────────
+# ─── Assemblage du bloc commun (prix intermédiaires + Greeks) ────────────────
 
-class _BumpedVolSurface:
+def _assemble(
+    p_0: float,
+    p_S_up: float, p_S_down: float, dS: float,
+    p_vol_up: float, p_vol_down: float, dvol_eff: float, vega_scale: float,
+    p_r_up: float, p_r_down: float, dr_eff: float,
+    p_T_up: float, p_T_down: float, dT_days_eff: float,
+) -> Dict[str, float]:
     """
-    Wrapper sur une VolSurface qui décale toutes les vols d'un montant fixe.
-
-    Override sigma() ET vol() car AnalyticalPricer utilise vol_surface.vol(T, K)
-    via _iv(), tandis que les produits exotiques utilisent vol_surface.sigma(T, K)
-    via dupire_local_vol().
+    Recompose le bloc unifié (prix p_* + 5 Greeks centrés) à partir des
+    repricings. `vega_scale` = 0.01 (par point de vol) pour le bump σ vanille,
+    1.0 pour le bump de variance Heston.
     """
+    delta = (p_S_up - p_S_down) / (2.0 * dS)
+    gamma = (p_S_up - 2.0 * p_0 + p_S_down) / (dS * dS)
+    vega  = (p_vol_up - p_vol_down) / dvol_eff * vega_scale
+    rho   = (p_r_up - p_r_down) / dr_eff * 0.0001
+    theta = (p_T_down - p_T_up) / dT_days_eff   # par jour calendaire
 
-    def __init__(self, base_surface, sigma_bump: float) -> None:
-        self._base = base_surface
-        self._bump = sigma_bump
+    return {
+        "p_0":        round(p_0,        6),
+        "p_S_up":     round(p_S_up,     6),
+        "p_S_down":   round(p_S_down,   6),
+        "p_vol_up":   round(p_vol_up,   6),
+        "p_vol_down": round(p_vol_down, 6),
+        "p_r_up":     round(p_r_up,     6),
+        "p_r_down":   round(p_r_down,   6),
+        "p_T_up":     round(p_T_up,     6),
+        "p_T_down":   round(p_T_down,   6),
+        "delta":      round(delta,      6),
+        "gamma":      round(gamma,      6),
+        "vega":       round(vega,       6),
+        "theta":      round(theta,      6),
+        "rho":        round(rho,        6),
+    }
 
-    def sigma(self, T: float, K: float) -> float:
-        return max(1e-4, self._base.sigma(T, K) + self._bump)
 
-    def vol(self, T: float, K: float) -> float:
-        return max(1e-4, self._base.vol(T, K) + self._bump)
+# ─── 2. FD centré, vol = σ (AL exotiques + MC vanilles GBM) ──────────────────
 
-    def __getattr__(self, name: str):
+def compute_greeks_fd_vol(
+    price_fn: Callable[[float, float, float, float, float], float],
+    price0: float,
+    S: float, r: float, q: float, sigma: float, T: float,
+    *,
+    dS_frac: float = 0.01,
+    dvol: float = 0.01,
+    dr: float = 1e-4,
+    dT_days: float = 1.0,
+) -> Dict[str, float]:
+    """
+    Greeks par différences finies CENTRÉES, le paramètre de vol étant σ.
+
+    price_fn(S, r, q, sigma, T) -> float
+    price0 : prix de base déjà calculé (= p_0, évite un repricing).
+
+    9 repricings (les 2 pour S servent à delta ET gamma).
+    Le `ratio`/quotité doit déjà être incorporé dans price_fn.
+
+    Mode d'emploi :
+      • AL exotique : price_fn = repricing analytique déterministe.
+      • MC vanille  : price_fn = repricing GBM avec le MÊME seed que p_0.
+    """
+    dS   = S * dS_frac
+    dT   = dT_days / 365.0
+    sv_dn = max(sigma - dvol, 1e-6)
+
+    p_0        = price0
+    p_S_up     = price_fn(S + dS, r,      q, sigma,      T)
+    p_S_down   = price_fn(S - dS, r,      q, sigma,      T)
+    p_vol_up   = price_fn(S,      r,      q, sigma + dvol, T)
+    p_vol_down = price_fn(S,      r,      q, sv_dn,        T)
+    p_r_up     = price_fn(S,      r + dr, q, sigma,      T)
+    p_r_down   = price_fn(S,      r - dr, q, sigma,      T)
+    T_dn       = max(T - dT, 1e-6)
+    p_T_up     = price_fn(S,      r,      q, sigma,      T + dT)
+    p_T_down   = price_fn(S,      r,      q, sigma,      T_dn)
+
+    dvol_eff    = (sigma + dvol) - sv_dn        # = 2·dvol sauf clipping
+    dT_days_eff = ((T + dT) - T_dn) * 365.0     # = 2·dT_days sauf clipping
+
+    return _assemble(
+        p_0,
+        p_S_up, p_S_down, dS,
+        p_vol_up, p_vol_down, dvol_eff, 0.01,    # vega par +1 pt de vol
+        p_r_up, p_r_down, 2.0 * dr,
+        p_T_up, p_T_down, dT_days_eff,
+    )
+
+
+# ─── 3. FD centré, vol = paramètres Heston (exotiques MC) ────────────────────
+
+def compute_greeks_fd_heston(
+    price_fn: Callable[..., float],
+    price0: float,
+    S: float, r: float, q: float, T: float,
+    params,
+    *,
+    dS_frac: float = 0.01,
+    dv: float = 0.01,
+    dr: float = 1e-4,
+    dT_days: float = 1.0,
+) -> Dict[str, float]:
+    """
+    Greeks par différences finies CENTRÉES sous Heston.
+
+    price_fn(S, r, q, T, params) -> float
+    price0 : prix de base déjà calculé (= p_0).
+
+    Vega : choc de NIVEAU DE VOL — shift parallèle de ±dv POINTS de vol
+           appliqué à √v0 ET √θ, puis reconverti en variance (v = σ²).
+           Rapporté par +1 point de vol (× 0.01), MÊME unité que le vega vanille.
+
+    Le MÊME seed doit être utilisé par price_fn pour p_0 et tous les chocs
+    (resimulation complète à chaque bump) → variance MC corrélée, Greeks stables.
+    """
+    dS = S * dS_frac
+    dT = dT_days / 365.0
+
+    p_0      = price0
+    p_S_up   = price_fn(S + dS, r,      q, T,      params)
+    p_S_down = price_fn(S - dS, r,      q, T,      params)
+
+    # Shift parallèle en VOL : ±dv points sur √v0 et √θ, reconvertis en variance.
+    vol_v0 = math.sqrt(max(params.v0,    0.0))
+    vol_th = math.sqrt(max(params.theta, 0.0))
+    v0_up, v0_dn = (vol_v0 + dv) ** 2, max(vol_v0 - dv, 1e-4) ** 2
+    th_up, th_dn = (vol_th + dv) ** 2, max(vol_th - dv, 1e-4) ** 2
+    params_vup = replace(params, v0=v0_up, theta=th_up)
+    params_vdn = replace(params, v0=v0_dn, theta=th_dn)
+    p_vol_up   = price_fn(S,      r,      q, T,      params_vup)
+    p_vol_down = price_fn(S,      r,      q, T,      params_vdn)
+
+    p_r_up   = price_fn(S,      r + dr, q, T,      params)
+    p_r_down = price_fn(S,      r - dr, q, T,      params)
+
+    T_dn     = max(T - dT, 1e-6)
+    p_T_up   = price_fn(S,      r,      q, T + dT, params)
+    p_T_down = price_fn(S,      r,      q, T_dn,   params)
+    dT_days_eff = ((T + dT) - T_dn) * 365.0
+
+    return _assemble(
+        p_0,
+        p_S_up, p_S_down, dS,
+        p_vol_up, p_vol_down, 2.0 * dv, 0.01,    # vega Heston par +1 point de vol
+        p_r_up, p_r_down, 2.0 * dr,
+        p_T_up, p_T_down, dT_days_eff,
+    )
+
+
+# Alias de compatibilité ascendante (ancien nom utilisé ailleurs).
+compute_greeks_gbm_vanilla = compute_greeks_fd_vol
+
+
+# ─── Marché bumpé (pour sensitivities : Stress / ScenarioGrid) ───────────────
+
+class _BumpedOIS:
+    """Courbe OIS décalée additivement de `rate_bump` (taux continu)."""
+
+    def __init__(self, base, rate_bump: float = 0.0) -> None:
+        self._base = base
+        self._b = rate_bump
+
+    def df_tau(self, tau: float) -> float:
+        return self._base.df_tau(tau) * math.exp(-self._b * tau)
+
+    def zero_rate_tau(self, tau: float) -> float:
+        return self._base.zero_rate_tau(tau) + self._b
+
+    def __getattr__(self, name):
         return getattr(self._base, name)
 
 
 class _BumpedMarket:
-    """Wrapper léger autour de MarketSnapshot avec paramètres modifiés."""
+    """
+    Vue « choquée » d'un MarketSnapshot, sans modifier l'original.
 
-    def __init__(self, base: MarketSnapshot, **overrides) -> None:
-        self._base = base
-        self._ov   = overrides
+    spot       : nouveau spot absolu (None = inchangé)
+    sigma_bump : choc ADDITIF sur toute la surface de vol (+0.05 = +5 pts)
+    rate_bump  : choc ADDITIF sur le taux continu (+0.01 = +100 bp)
 
-    def __getattr__(self, name: str):
-        if name in self._ov:
-            return self._ov[name]
-        return getattr(self._base, name)
+    Expose la même interface que MarketSnapshot pour les pricers
+    (spot, r, q, vol_surface, ois_curve, div_curve, valuation_date, ticker).
+    """
 
-    @property
-    def vol_surface(self):
-        if "sigma_bump" in self._ov:
-            return _BumpedVolSurface(self._base.vol_surface, self._ov["sigma_bump"])
-        return self._base.vol_surface
+    def __init__(self, base, spot: Optional[float] = None,
+                 sigma_bump: float = 0.0, rate_bump: float = 0.0) -> None:
+        self._base          = base
+        self.ticker         = base.ticker
+        self.valuation_date = base.valuation_date
+        self.div_curve      = base.div_curve
+        self.spot           = base.spot if spot is None else float(spot)
+        self.ois_curve      = _BumpedOIS(base.ois_curve, rate_bump) if rate_bump else base.ois_curve
 
-    def sigma(self, T: float, K: float) -> float:
-        return self.vol_surface.sigma(T, K)
-
-    def df(self, tau: float) -> float:
-        if "rate_bump" in self._ov:
-            r_new = self._base.r + self._ov["rate_bump"]
-            return math.exp(-r_new * tau)
-        return self._base.df(tau)
+        if sigma_bump:
+            from pricing_lib.market_data.vol_surface import VolSurface
+            bs = base.vol_surface
+            self.vol_surface = VolSurface(
+                bs.valuation_date, bs.spot, bs.r, bs.q,
+                bs.tenors, bs.strikes, bs.vols + sigma_bump,
+            )
+        else:
+            self.vol_surface = base.vol_surface
 
     @property
     def r(self) -> float:
-        if "rate_bump" in self._ov:
-            return self._base.r + self._ov["rate_bump"]
-        return self._base.r
+        return self.ois_curve.zero_rate_tau(1.0)
 
     @property
     def q(self) -> float:
-        return self._base.q
+        return self.div_curve.q
 
-    @property
-    def spot(self) -> float:
-        return self._ov.get("spot", self._base.spot)
+    def sigma(self, T: float, K: float) -> float:
+        return self.vol_surface.vol(T, K)
 
+    def atm_vol(self, T: float) -> float:
+        return self.vol_surface.atm_vol(T)
 
-def _bump_spot(market: MarketSnapshot, dS: float) -> _BumpedMarket:
-    return _BumpedMarket(market, spot=market.spot + dS)
-
-
-def _bump_vol(market: MarketSnapshot, dsig: float) -> _BumpedMarket:
-    return _BumpedMarket(market, sigma_bump=dsig)
-
-
-def _bump_rate(market: MarketSnapshot, dr: float) -> _BumpedMarket:
-    return _BumpedMarket(market, rate_bump=dr)
-
-
-def _bump_product_maturity(product, dT: float):
-    """Retourne une copie du produit avec maturity décalée de dT."""
-    import dataclasses
-    if dataclasses.is_dataclass(product):
-        if hasattr(product, "obs_times"):
-            new_obs = [t + dT for t in product.obs_times]
-            return dataclasses.replace(product, obs_times=new_obs)
-        if hasattr(product, "maturity"):
-            return dataclasses.replace(product, maturity=product.maturity + dT)
-    return product
-
-
-# ─── Adaptateur générique ─────────────────────────────────────────────────────
-
-class _ClosurePricer:
-    """
-    Adapte n'importe quelle fonction f(market) -> float a l'interface pricer
-    attendue par FiniteDiffGreeks, ScenarioAnalyzer et StressTest.
-    """
-
-    def __init__(self, fn) -> None:
-        self._fn = fn
-
-    def price(self, product, market) -> object:
-        class _R:
-            pass
-        r = _R()
-        r.price = self._fn(market)
-        return r
+    def df(self, tau: float) -> float:
+        return self.ois_curve.df_tau(tau)

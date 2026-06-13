@@ -57,7 +57,8 @@ Usage — Gestion des risques
 
     # Accès direct au snapshot pour usage avancé avec les classes risk
     snap = build_snapshot('GLE', 100, '02/05/2026')
-    from pricing_lib.risk import FiniteDiffGreeks, StressTest, ScenarioAnalyzer
+    from pricing_lib.risk import StressTest, ScenarioAnalyzer
+    # Les Greeks de chaque produit sont dans result.greeks (centrés, avec bloc p_*).
 """
 
 from __future__ import annotations
@@ -77,9 +78,9 @@ from pricing_lib.pricers.base import PricingResult
 from pricing_lib.pricers.analytical import AnalyticalPricer
 from pricing_lib.pricers.mc import MCPricer
 from pricing_lib.pricers.autocalls import PhoenixPricer, AthenaPricer
+from pricing_lib.risk.greeks import compute_greeks_bs, compute_greeks_fd_vol
 from pricing_lib.risk import (
-    FiniteDiffGreeks, GreeksResult, _ClosurePricer,
-    ScenarioAnalyzer, StressTest, STANDARD_STRESSES, StressScenario,
+    StressTest, ScenarioAnalyzer, StressScenario, STANDARD_STRESSES, _ClosurePricer,
 )
 
 _SNAPSHOT_CACHE: dict = {}
@@ -129,6 +130,7 @@ def _build_snapshot(
     spot: float,
     valuation_date: date,
     verbose: bool = True,
+    use_ssvi: bool = True,
 ) -> MarketSnapshot:
     """
     Récupère toutes les données de marché et construit le MarketSnapshot.
@@ -177,6 +179,20 @@ def _build_snapshot(
         if verbose:
             print(f"[Snapshot] VolSurface indisponible ({e}) — surface plate 25%")
         surf = VolSurface.flat(valuation_date, spot, r_1y, div.q, 0.25)
+
+    # Surface SSVI sans-arbitrage (Gatheral-Jacquier) : lisse la surface brute,
+    # rend Dupire et la calibration Heston stables. Repli silencieux sur la
+    # surface brute si la calibration SSVI échoue.
+    if use_ssvi:
+        try:
+            from pricing_lib.market_data.ssvi import ssvi_from_grid
+            surf_ssvi = ssvi_from_grid(surf)
+            if verbose:
+                print(f"[Snapshot] SSVI OK — {surf_ssvi}")
+            surf = surf_ssvi
+        except Exception as e:
+            if verbose:
+                print(f"[Snapshot] SSVI indisponible ({e}) — surface brute conservée")
 
     snap = MarketSnapshot(
         ticker=ticker,
@@ -728,7 +744,7 @@ def build_snapshot(ticker: str, spot: float, start_date: str) -> MarketSnapshot:
 
     Utile pour utiliser directement les classes du module risk :
         snap = build_snapshot('GLE', 100, '02/05/2026')
-        from pricing_lib.risk import FiniteDiffGreeks, StressTest
+        from pricing_lib.risk import StressTest, ScenarioAnalyzer
     """
     return _build_snapshot(ticker, float(spot), _parse_date(start_date))
 
@@ -772,21 +788,6 @@ def _make_pricer_fn(mode: str, product: str, snap: MarketSnapshot,
                 "Options: call, put, rc, bonus, reverse_bonus, twin_win, airbag, discount.")
     return _fn
 
-def Greeks(mode: str, ticker: str, *args,
-           product: str = "call", seed: Optional[int] = None, **pkwargs) -> GreeksResult:
-    """
-    Greeks par differences finies centrees.
-    AL : Greeks('AL', 'GLE', spot, start_date, maturity, product='call', K=71)
-    AL : Greeks('AL', 'GLE', spot, start_date, maturity, product='rc', freq='Q')
-    """
-    mode = mode.upper()
-    spot_val, start_str, tenor_str = (args if len(args)==3 else args[1:])
-    n_paths = None if len(args)==3 else int(args[0])
-    snap   = _build_snapshot(ticker, float(spot_val), _parse_date(start_str))
-    T      = _parse_tenor(tenor_str)
-    fn     = _make_pricer_fn(mode, product, snap, T, _parse_date(start_str), n_paths, seed, **pkwargs)
-    return FiniteDiffGreeks(_ClosurePricer(fn), None, snap).all()
-
 def Stress(mode: str, ticker: str, *args,
            product: str = "call", seed: Optional[int] = None,
            scenarios: Optional[List[StressScenario]] = None, **pkwargs) -> "pd.DataFrame":
@@ -827,37 +828,20 @@ def ScenarioGrid(mode: str, ticker: str, *args,
 
 # ── Exemple d'utilisation (exécuter directement : python -m pricing_lib.api) ──
 if __name__ == "__main__":
+
     
-    y = Phoenix('AL', 'GLE', 100000, '29/05/2026', 71,
+    phx = Phoenix('AL', 'GLE', 100000, '29/05/2026', 71,
             barrier_coupon=0.70,
             barrier_recall=1.00,
             capital_barrier=0.50,
-            freq_months=3, maturity='12M', kg='no')
+            freq_months=3, maturity='12M', kg='no',compute_greeks=True)
 
-    y_mc = Phoenix('MC', 'GLE', 100000, '29/05/2026', 71,
+    phx_mc = Phoenix('MC', 'GLE', 100000, '29/05/2026', 71,
                coupon=0.0455,
                barrier_coupon=0.70,
                barrier_recall=1.00,
                capital_barrier=0.50,
                freq_months=3, maturity='60M', kg='no',
                compute_greeks=True)
-    print(y_mc) 
     
-
-
-'''
-Stress('AL', 'GLE', 100, '02/05/2026', '3M', product='call', K=100)
-# Reverse Convertible trimestriel
-Stress('AL', 'GLE', 71, '29/05/2026', '12M', product='rc', freq='Q')
-
-# Bonus Certificate (bonus 110%, barrière 65%)
-Stress('AL', 'GLE', 71, '29/05/2026', '12M', product='bonus', X=78, B=46)
-
-# Twin Win (strike ATM, barrière 65%)
-Stress('AL', 'GLE', 71, '29/05/2026', '24M', product='twin_win', X=71, B=46)
-
-# Airbag
-df = Stress('AL', 'GLE', 71, '29/05/2026', '24M', product='airbag', X=71, B=50)
-
-
-print(df)'''
+ 

@@ -730,9 +730,13 @@ def dupire_local_vol(
     ∂w/∂y  = K · ∂w/∂K              (règle de la chaîne, y = ln K − ln F)
     ∂²w/∂y²= K²·∂²w/∂K² + K·∂w/∂K
     """
+    # Surface SSVI : vol locale ANALYTIQUE (derivees en strike fermees) -> court-circuit.
+    if hasattr(surf, "local_vol"):
+        return surf.local_vol(T, K)
+
     S, r, q = surf.spot, surf.r, surf.q
 
-    # ── variance totale implicite w(t, k) = σ²_IV · t ────────────────────────
+    #── variance totale implicite w(t, k) = σ²_IV · t ────────────────────────
     def w(t: float, k: float) -> float:
         k_clipped = float(np.clip(k, surf.strikes[0], surf.strikes[-1]))
         return surf.vol(t, k_clipped) ** 2 * t

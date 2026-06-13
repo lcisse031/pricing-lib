@@ -14,8 +14,28 @@ from typing import Callable, List, Optional, Dict
 
 import numpy as np
 
+from types import SimpleNamespace
+
 from ..market_data.market_snapshot import MarketSnapshot
 from .greeks import _BumpedMarket
+
+
+# ─── Adaptateur closure → interface pricer ───────────────────────────────────
+
+class _ClosurePricer:
+    """
+    Enveloppe une closure f(market) -> float (prix) dans l'interface
+    attendue par StressTest / ScenarioAnalyzer : .price(product, market[, model]).
+
+    Permet de stresser n'importe quel produit via une simple fonction de prix,
+    sans dépendre d'une classe Pricer concrète.
+    """
+
+    def __init__(self, fn: Callable[[MarketSnapshot], float]) -> None:
+        self._fn = fn
+
+    def price(self, product, market, model=None) -> SimpleNamespace:
+        return SimpleNamespace(price=float(self._fn(market)))
 
 
 # ─── ScenarioAnalyzer ────────────────────────────────────────────────────────

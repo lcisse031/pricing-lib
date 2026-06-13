@@ -140,19 +140,23 @@ def heston_cf(
         kappa - rho * sigma_v * 1j * u + d
     )
 
-    exp_dT          = np.exp(-d * T)
-    one_minus_g_exp = 1.0 - g * exp_dT
-    one_minus_g     = 1.0 - g
+    eps = 1e-300   # garde-fou : évite log(0)/div 0 sur params dégénérés
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        exp_dT          = np.exp(-d * T)
+        one_minus_g_exp = 1.0 - g * exp_dT
+        one_minus_g     = 1.0 - g
 
-    C = (r - q) * 1j * u * T + (kappa * theta / sigma_v ** 2) * (
-        (kappa - rho * sigma_v * 1j * u - d) * T
-        - 2.0 * np.log(one_minus_g_exp / one_minus_g)
-    )
-    D = ((kappa - rho * sigma_v * 1j * u - d) / sigma_v ** 2) * (
-        (1.0 - exp_dT) / one_minus_g_exp
-    )
+        # NB : la dérive (r−q) est déjà portée par x = ln S + (r−q)T (terme i·u·x).
+        # Ne PAS la rajouter ici sinon double comptage (φ(−i) ≠ E[S_T], prix biaisés).
+        C = (kappa * theta / sigma_v ** 2) * (
+            (kappa - rho * sigma_v * 1j * u - d) * T
+            - 2.0 * np.log((one_minus_g_exp + eps) / (one_minus_g + eps))
+        )
+        D = ((kappa - rho * sigma_v * 1j * u - d) / sigma_v ** 2) * (
+            (1.0 - exp_dT) / (one_minus_g_exp + eps)
+        )
 
-    return np.exp(C + D * v0 + 1j * u * x)
+        return np.exp(C + D * v0 + 1j * u * x)
 
 
 # ─── Pricing semi-fermé (scalaire K) ─────────────────────────────────────────
@@ -224,14 +228,21 @@ def _cf_finish(
     --------
     np.ndarray complexe (N,) — valeurs de la CF
     """
-    x               = np.log(S) + (r - q) * T
-    exp_dT          = np.exp(-d * T)
-    one_minus_g_exp = 1.0 - g * exp_dT
-    C = (r - q) * 1j * u * T + (kappa * theta / sigma_v ** 2) * (
-        coef * T - 2.0 * np.log(one_minus_g_exp / (1.0 - g))
-    )
-    D = (coef / sigma_v ** 2) * ((1.0 - exp_dT) / one_minus_g_exp)
-    return np.exp(C + D * v0 + 1j * u * x)
+    # Garde-fous numériques : sur des params dégénérés (calibration sur surface
+    # pauvre/plate), one_minus_g_exp ou (1−g) peuvent friser 0 → log(0)/div 0.
+    # eps complexe + np.errstate évitent un crash (certains environnements
+    # remontent les warnings numpy en erreurs).
+    eps = 1e-300
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        x               = np.log(S) + (r - q) * T
+        exp_dT          = np.exp(-d * T)
+        one_minus_g_exp = 1.0 - g * exp_dT
+        # (r−q) déjà dans x = ln S + (r−q)T — pas de double comptage ici.
+        C = (kappa * theta / sigma_v ** 2) * (
+            coef * T - 2.0 * np.log((one_minus_g_exp + eps) / (1.0 - g + eps))
+        )
+        D = (coef / sigma_v ** 2) * ((1.0 - exp_dT) / (one_minus_g_exp + eps))
+        return np.exp(C + D * v0 + 1j * u * x)
 
 
 def heston_price(
@@ -398,6 +409,9 @@ def calibrate_heston(
     q: float,
     weights: Optional[np.ndarray] = None,
     seed: int = 42,
+    prev_params: Optional[HestonParams] = None,
+    reg_weight: float = 0.0,
+    rmse_warn: float = 0.02,
 ) -> HestonParams:
     """
     Calibre les paramètres Heston sur une VolSurface Euronext.
@@ -453,6 +467,19 @@ def calibrate_heston(
         if valid.sum() < 2:
             continue
         mkt_vols[i] = np.interp(K_targets, strikes_all[valid], row[valid])
+
+    # ── Ancrage ATM : v0 ≈ variance ATM courte, θ ≈ variance ATM longue ────────
+    # (approche desk : on pin le NIVEAU de variance aux vols ATM observables ;
+    # seule la FORME du smile — σ_v, ρ — est laissée libre au calibrateur).
+    _atm_col = 2   # moneyness 1.00 dans target_m
+    _atm = np.array([mkt_vols[i, _atm_col] if (np.isfinite(mkt_vols[i, _atm_col])
+                     and mkt_vols[i, _atm_col] > 0) else np.nan
+                     for i in range(len(tenors))])
+    _fin = _atm[np.isfinite(_atm)]
+    v_front = float(_fin[0] ** 2)  if len(_fin) else 0.0784
+    v_back  = float(_fin[-1] ** 2) if len(_fin) else 0.0784
+    v_front = min(max(v_front, 0.0025), 0.39)   # vol ATM bornée ∈ [5 %, ~62 %]
+    v_back  = min(max(v_back,  0.0025), 0.39)
 
     # ── Pondération gaussienne ATM ────────────────────────────────────────────
     moneyness = strikes / S
@@ -512,6 +539,21 @@ def calibrate_heston(
             feller_viol = max(0.0, sigma_v ** 2 - 2.0 * kappa * theta)
             penalty = 15.0 * feller_viol ** 2   # λ=15 : moins bloquant que 50
 
+            # Ancrage ATM (fort) : v0 et θ collés aux variances ATM de marché.
+            # Empêche le niveau de partir en vrille sur surface pauvre/plate.
+            penalty += 50.0 * ((v0 - v_front) ** 2 + (theta - v_back) ** 2)
+
+            # Prior doux sur la FORME du smile (σ_v, ρ) et la vitesse κ : n'agit
+            # que si la surface ne les contraint pas (cas plat → κ indéterminé
+            # quand v0=θ) → évite les paramètres aux bornes.
+            penalty += 0.5 * ((sigma_v - 0.40) ** 2 + (rho + 0.50) ** 2)
+            penalty += 0.002 * (kappa - 3.0) ** 2
+
+            # Régularisation : pénalise les sauts vs la calibration précédente
+            # (stabilité jour à jour façon desk).
+            if prev_params is not None and reg_weight > 0.0:
+                penalty += reg_weight * float(np.sum((x - prev_params.to_array()) ** 2))
+
             total = 0.0
             n_pts = 0
             for i, T in enumerate(tenors):
@@ -555,9 +597,10 @@ def calibrate_heston(
         (0.01,  0.40),   # v0
     ]
 
-    # Point d'initialisation réaliste (centre de la zone crédible equity)
-    # theta=0.04 → vol_inf≈20%, v0=0.0625 → vol_init≈25%
-    x0 = np.array([4.0, 0.04, 0.70, -0.50, 0.0625])
+    # Initialisation ancrée sur l'ATM : v0=variance ATM courte, θ=variance ATM
+    # longue (warm-start si une calibration précédente est fournie).
+    x0 = (prev_params.to_array() if prev_params is not None
+          else np.array([4.0, v_back, 0.40, -0.50, v_front]))
 
     print("[Heston] Calibration — recherche globale (differential_evolution)...")
     result_de = differential_evolution(
@@ -583,11 +626,129 @@ def calibrate_heston(
         options={"ftol": 1e-12, "gtol": 1e-9, "maxiter": 500},
     )
 
-    params = HestonParams.from_array(result.x)
-    rmse   = math.sqrt(result.fun) * 100
-    print(f"[Heston] Calibration terminée — résidu={rmse:.4f}%")
+    params  = HestonParams.from_array(result.x)
+    rmse    = math.sqrt(max(result.fun, 0.0))      # résidu vol-normalisé (fraction)
+    bnames  = ("kappa", "theta", "sigma_v", "rho", "v0")
+
+    # ── Rapport de calibration (gates desk) ──────────────────────────────────
+    at_bound = []
+    for v, (lo, hi), nm in zip(result.x, bounds, bnames):
+        if abs(v - lo) <= 1e-3 * max(abs(lo), 1.0) or abs(v - hi) <= 1e-3 * max(abs(hi), 1.0):
+            at_bound.append(nm)
+
+    print(f"[Heston] Calibration terminée — résidu RMSE={rmse*100:.4f}% vol")
     print(f"[Heston] {params}")
+    if params.feller < 1.0:
+        print(f"[Heston] ⚠ Feller {params.feller:.2f} < 1 — variance peut toucher 0 "
+              f"(QE gère, mais smile court terme à surveiller).")
+    if at_bound:
+        print(f"[Heston] ⚠ Paramètre(s) collé(s) aux bornes : {', '.join(at_bound)} "
+              f"— calibration possiblement mal posée (surface pauvre ?).")
+    if rmse > rmse_warn:
+        print(f"[Heston] ⚠ Résidu {rmse*100:.2f}% > seuil {rmse_warn*100:.1f}% "
+              f"— fit médiocre, prix exotiques à prendre avec prudence.")
     return params
+
+
+# ─── Schéma Quadratic-Exponential (Andersen 2008) ────────────────────────────
+
+_QE_PSI_C = 1.5   # seuil de bascule quadratique / exponentielle
+
+
+def _simulate_heston_qe(
+    S: float, r: float, q: float, T: float, params: HestonParams,
+    n_paths: int, observation_times: np.ndarray,
+    n_steps: int, antithetic: bool, seed: Optional[int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Simulation Heston par le schéma QE d'Andersen (2008).
+
+    • Variance : Quadratic-Exponential (exact en loi sur le moment conditionnel),
+      sans biais de troncature contrairement à Euler full-truncation.
+    • Log-spot : discrétisation centrale (γ₁=γ₂=½) avec correction martingale
+      (K0..K4), corrélation ρ injectée via les termes en V (pas en corrélant
+      les browniens) — propriété clé du QE.
+
+    Retourne (observation_times, paths[n_paths, n_obs]).
+    """
+    kappa, theta, sigma_v, rho, v0 = (
+        params.kappa, params.theta, params.sigma_v, params.rho, params.v0
+    )
+    dt = T / n_steps
+    E  = math.exp(-kappa * dt)
+
+    # Constantes log-spot (Andersen, central discretization γ1=γ2=0.5)
+    g1 = g2 = 0.5
+    K0 = -rho * kappa * theta * dt / sigma_v
+    K1 = g1 * dt * (kappa * rho / sigma_v - 0.5) - rho / sigma_v
+    K2 = g2 * dt * (kappa * rho / sigma_v - 0.5) + rho / sigma_v
+    K3 = g1 * dt * (1.0 - rho ** 2)
+    K4 = g2 * dt * (1.0 - rho ** 2)
+
+    rng = np.random.default_rng(seed)
+    if antithetic:
+        n_half = n_paths // 2
+        n_act  = n_half * 2
+        ZV = rng.standard_normal((n_steps, n_half))
+        ZS = rng.standard_normal((n_steps, n_half))
+        UU = rng.random((n_steps, n_half))
+        # Antithétique : réflexion des normales, U → 1−U (lois préservées → non biaisé)
+        ZV = np.concatenate([ZV, -ZV], axis=1)
+        ZS = np.concatenate([ZS, -ZS], axis=1)
+        UU = np.concatenate([UU, 1.0 - UU], axis=1)
+    else:
+        n_act = n_paths
+        ZV = rng.standard_normal((n_steps, n_act))
+        ZS = rng.standard_normal((n_steps, n_act))
+        UU = rng.random((n_steps, n_act))
+
+    log_S = np.full(n_act, math.log(S))
+    V     = np.full(n_act, v0)
+
+    step_times = np.linspace(dt, T, n_steps)
+    obs_idx = np.array([int(np.argmin(np.abs(step_times - t)))
+                        for t in observation_times])
+    obs_map = {idx: i for i, idx in enumerate(obs_idx)}
+    obs_set = set(obs_idx.tolist())
+    paths   = np.zeros((n_act, len(observation_times)))
+
+    eps = 1e-12
+    for t in range(n_steps):
+        m  = theta + (V - theta) * E
+        m  = np.maximum(m, eps)
+        s2 = (V * sigma_v ** 2 * E * (1.0 - E) / kappa
+              + theta * sigma_v ** 2 * (1.0 - E) ** 2 / (2.0 * kappa))
+        psi = s2 / (m * m)
+
+        V_next = np.empty_like(V)
+
+        # Branche quadratique  (psi <= psi_c)
+        quad = psi <= _QE_PSI_C
+        if np.any(quad):
+            inv = 2.0 / psi[quad]
+            b2  = inv - 1.0 + np.sqrt(inv) * np.sqrt(np.maximum(inv - 1.0, 0.0))
+            a   = m[quad] / (1.0 + b2)
+            V_next[quad] = a * (np.sqrt(b2) + ZV[t, quad]) ** 2
+
+        # Branche exponentielle (psi > psi_c)
+        expb = ~quad
+        if np.any(expb):
+            pe   = (psi[expb] - 1.0) / (psi[expb] + 1.0)
+            beta = (1.0 - pe) / m[expb]
+            u    = UU[t, expb]
+            vv   = np.where(u <= pe, 0.0,
+                            np.log(np.maximum((1.0 - pe) / np.maximum(1.0 - u, eps), eps)) / beta)
+            V_next[expb] = vv
+
+        log_S = (log_S + (r - q) * dt + K0
+                 + K1 * V + K2 * V_next
+                 + np.sqrt(np.maximum(K3 * V + K4 * V_next, 0.0)) * ZS[t])
+        V = V_next
+
+        if t in obs_set:
+            paths[:, obs_map[t]] = np.exp(log_S)
+
+    return observation_times, paths
 
 
 # ─── Simulation MC terminale ──────────────────────────────────────────────────
@@ -602,14 +763,15 @@ def heston_simulate(
     n_steps: Optional[int] = None,
     antithetic: bool = True,
     seed: Optional[int] = None,
+    scheme: str = "qe",
 ) -> np.ndarray:
     """
     Simulation MC Heston — retourne les prix terminaux S_T.
 
-    Schéma Euler-Maruyama + full truncation sur V.
+    scheme="qe"    : Quadratic-Exponential d'Andersen (défaut, sans biais).
+    scheme="euler" : Euler-Maruyama full-truncation (legacy).
 
-    n_steps par défaut : 100/an (au lieu de 252) — suffisant pour les
-    produits à payoff terminal (vanilles, certificats sans barrière continue).
+    n_steps par défaut : 100/an — suffisant pour les produits à payoff terminal.
     Pour les produits path-dépendants utilisez heston_simulate_paths.
 
     Retourne
@@ -618,6 +780,12 @@ def heston_simulate(
     """
     if n_steps is None:
         n_steps = max(int(100 * T), 30)   # 100/an suffit pour payoff terminal
+
+    if scheme == "qe":
+        _, paths = _simulate_heston_qe(
+            S, r, q, T, params, n_paths, np.array([T]), n_steps, antithetic, seed
+        )
+        return paths[:, -1]
 
     dt      = T / n_steps
     sqrt_dt = math.sqrt(dt)
@@ -670,6 +838,7 @@ def heston_simulate_paths(
     n_steps: Optional[int] = None,
     antithetic: bool = True,
     seed: Optional[int] = None,
+    scheme: str = "qe",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Simulation MC Heston avec enregistrement aux dates d'observation.
@@ -690,6 +859,11 @@ def heston_simulate_paths(
     """
     if n_steps is None:
         n_steps = max(int(252 * T), 50)   # 252/an — précision barrière continue
+
+    if scheme == "qe":
+        return _simulate_heston_qe(
+            S, r, q, T, params, n_paths, observation_times, n_steps, antithetic, seed
+        )
 
     dt       = T / n_steps
     sqrt_dt  = math.sqrt(dt)
@@ -729,4 +903,24 @@ def heston_simulate_paths(
     paths  = np.zeros((n_actual, len(observation_times)))
 
     for t in range(n_steps):
-        V_pos  = np.maximum(V, 0.0
+        V_pos  = np.maximum(V, 0.0)
+        sqrt_V = np.sqrt(V_pos)
+        V      = V + kappa * (theta - V_pos) * dt + sigma_v * sqrt_V * sqrt_dt * ZV[t]
+        log_S  = log_S + (r - q - 0.5 * V_pos) * dt + sqrt_V * sqrt_dt * ZS[t]
+
+        if t in obs_set:
+            paths[:, obs_map[t]] = np.exp(log_S)
+
+    return observation_times, paths
+
+
+# ─── Paramètres par défaut (desk) ─────────────────────────────────────────────
+
+DEFAULT_HESTON = HestonParams(
+    kappa=2.0,
+    theta=0.04,    # vol long terme 20%
+    sigma_v=0.30,
+    rho=-0.70,
+    v0=0.04,       # vol initiale 20%
+)
+

@@ -42,8 +42,9 @@ from pricing_lib.backtest.market_loader import (
 from pricing_lib.market_data.market_snapshot import MarketSnapshot
 from pricing_lib.market_data.vol_surface import VolSurface
 from pricing_lib.pricers.analytical import AnalyticalPricer
-from pricing_lib.pricers.mc import MCPricer
+from pricing_lib.pricers.mc import MCPricer, get_heston_params
 from pricing_lib.pricers.autocalls import PhoenixPricer, AthenaPricer
+from pricing_lib.risk.greeks import _BumpedMarket   # courbe OIS décalée (rho complet)
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +207,65 @@ class _BumpedSnap:
 
 
 # ---------------------------------------------------------------------------
+# Autocalls : barrières figées à l'inception + pricing à params explicites
+# ---------------------------------------------------------------------------
+
+def _autocall_inception_barriers(spec: PositionSpec) -> tuple:
+    """
+    Barrières ABSOLUES figées au spot d'inception (spec.spot).
+
+    Dans un backtest, les barrières d'un autocall sont fixées à la signature
+    du trade — elles NE doivent PAS être re-strikées au spot courant chaque
+    jour (sinon le produit reste à moneyness constante → MtM figé, delta nul).
+
+    Retourne (Bc, Br, Bk) en niveaux absolus (Bc = 0 pour Athena).
+    """
+    p  = spec.params
+    S0 = float(spec.spot)
+
+    def _abs(x):
+        return x * S0 if (x is not None and x < 10) else x
+
+    Bc = _abs(p.get("barrier_coupon", 0.0)) if "barrier_coupon" in p else 0.0
+    Br = _abs(p["barrier_recall"])
+    Bk = _abs(p["capital_barrier"])
+    return Bc, Br, Bk
+
+
+def _price_autocall(spec: PositionSpec, snap, S0: float, T: float,
+                    params, seed, barriers: tuple) -> float:
+    """
+    Price un autocall (phoenix/athena) en MC Heston avec :
+      • S0 explicite (le spot, éventuellement bumpé pour delta/gamma),
+      • barrières ABSOLUES figées (barriers),
+      • params Heston explicites (None → calibration cachée par ticker),
+      • coupon = celui du spec (figé), seed fixe → bump & reprice stable.
+    Retourne le prix unitaire (% du nominal).
+    """
+    p = spec.params
+    Bc, Br, Bk = barriers
+    mat_months = max(1, round(T * 12))
+    if spec.product_type == "phoenix":
+        return PhoenixPricer(
+            snapshot=snap, n_paths=spec.n_paths, start_date=snap.valuation_date,
+            S0=S0, barrier_coupon=Bc, barrier_recall=Br, capital_barrier=Bk,
+            freq_months=int(p.get("freq_months", 3)), maturity_months=mat_months,
+            kg=p.get("kg", "no"), autocall_start=int(p.get("autocall_start", 0)),
+            mode="MC", coupon=float(p.get("coupon", 0.0)),
+            compute_greeks=False, params=params, seed=seed,
+        ).price().price
+    else:  # athena
+        return AthenaPricer(
+            snapshot=snap, n_paths=spec.n_paths, start_date=snap.valuation_date,
+            S0=S0, barrier_recall=Br, capital_barrier=Bk,
+            freq_months=int(p.get("freq_months", 3)), maturity_months=mat_months,
+            kg=p.get("kg", "no"),
+            mode="MC", coupon=float(p.get("coupon", 0.0)),
+            compute_greeks=False, params=params, seed=seed,
+        ).price().price
+
+
+# ---------------------------------------------------------------------------
 # Pricing d'une position
 # ---------------------------------------------------------------------------
 
@@ -261,35 +321,10 @@ def _price_position(spec: PositionSpec, snap: MarketSnapshot, T: float) -> float
         n_paths = spec.n_paths
         seed    = spec.seed
 
-        if pt in ("phoenix",):
-            Bc = p["barrier_coupon"]  * snap.spot if p["barrier_coupon"]  < 10 else p["barrier_coupon"]
-            Br = p["barrier_recall"]  * snap.spot if p["barrier_recall"]  < 10 else p["barrier_recall"]
-            Bk = p["capital_barrier"] * snap.spot if p["capital_barrier"] < 10 else p["capital_barrier"]
-            mat_months = max(1, round(T * 12))
-            return PhoenixPricer(
-                snapshot=snap, n_paths=n_paths, start_date=snap.valuation_date,
-                S0=snap.spot, barrier_coupon=Bc, barrier_recall=Br, capital_barrier=Bk,
-                freq_months=int(p.get("freq_months", 3)),
-                maturity_months=mat_months,
-                kg=p.get("kg", "no"),
-                autocall_start=int(p.get("autocall_start", 0)),
-                mode="MC", coupon=float(p.get("coupon", 0.0)),
-                compute_greeks=False, seed=seed,
-            ).price().price
-
-        elif pt in ("athena",):
-            Br = p["barrier_recall"]  * snap.spot if p["barrier_recall"]  < 10 else p["barrier_recall"]
-            Bk = p["capital_barrier"] * snap.spot if p["capital_barrier"] < 10 else p["capital_barrier"]
-            mat_months = max(1, round(T * 12))
-            return AthenaPricer(
-                snapshot=snap, n_paths=n_paths, start_date=snap.valuation_date,
-                S0=snap.spot, barrier_recall=Br, capital_barrier=Bk,
-                freq_months=int(p.get("freq_months", 3)),
-                maturity_months=mat_months,
-                kg=p.get("kg", "no"),
-                mode="MC", coupon=float(p.get("coupon", 0.0)),
-                compute_greeks=False, seed=seed,
-            ).price().price
+        if pt in ("phoenix", "athena"):
+            # Barrières FIGÉES au spot d'inception ; S0 = spot du jour (le sous-jacent bouge).
+            barriers = _autocall_inception_barriers(spec)
+            return _price_autocall(spec, snap, snap.spot, T, None, seed, barriers)
 
         else:
             mc = MCPricer(snap, n_paths, seed=seed)
@@ -335,7 +370,7 @@ def _compute_greeks(
     snap:    MarketSnapshot,
     T:       float,
     p0:      float,
-    dS_frac: float = 0.001,
+    dS_frac: float = 0.01,
     dsig:    float = 0.01,
 ) -> dict:
     """
@@ -370,18 +405,106 @@ def _compute_greeks(
     p_vu    = _price_position(spec, snap_vu, T)
     p_vd    = _price_position(spec, snap_vd, T)
     vega    = (p_vu - p_vd) / (2 * dsig)  # par unite de sigma decimal
+    vomma   = (p_vu - 2 * p0 + p_vd) / (dsig ** 2)  # convexite de vega (vol gamma)
 
-    # Theta -- decalage d'1 jour calendaire vers la maturite
-    dT    = 1.0 / 365.0
-    T_sh  = max(T - dT, 1e-6)
-    p_th  = _price_position(spec, snap, T_sh)
-    theta = (p_th - p0) / dT  # annualise
+    # Rho -- bump taux CENTRE via courbe OIS decalee (drift ET actualisation)
+    dr   = 1e-4
+    p_ru = _price_position(spec, _BumpedMarket(snap, rate_bump=+dr), T)
+    p_rd = _price_position(spec, _BumpedMarket(snap, rate_bump=-dr), T)
+    rho  = (p_ru - p_rd) / (2 * dr)   # par unite de taux (raw)
+
+    # Theta -- decalage calendaire CENTRE (+/- 1 jour)
+    dT     = 1.0 / 365.0
+    T_dn   = max(T - dT, 1e-6)
+    T_up   = T + dT
+    p_T_dn = _price_position(spec, snap, T_dn)
+    p_T_up = _price_position(spec, snap, T_up)
+    theta  = (p_T_dn - p_T_up) / (T_up - T_dn)  # annualise, centre
 
     return {
-        "delta": float(delta),
-        "gamma": float(gamma),
-        "vega":  float(vega),
-        "theta": float(theta),
+        "delta":    float(delta),
+        "gamma":    float(gamma),
+        "vega":     float(vega),
+        "vomma":    float(vomma),
+        "rho":      float(rho),
+        "theta":    float(theta),
+        "price_up": float(p_su),
+        "price_dn": float(p_sd),
+    }
+
+
+def _autocall_greeks(
+    spec:    PositionSpec,
+    snap:    MarketSnapshot,
+    T:       float,
+    dS_frac: float = 0.01,
+    dvol:    float = 0.01,
+) -> dict:
+    """
+    Greeks d'un autocall (phoenix/athena) pour le backtest, par bump & reprice
+    MC à coupon FIGÉ — convention RAW du moteur (cohérente avec _compute_greeks
+    et l'attribution P&L) :
+
+      delta/gamma : S0 ± dS, barrières FIGÉES à l'inception (pas de re-strike).
+      vega        : shift parallèle ±dvol pt de vol sur les PARAMS Heston
+                    (√v0, √θ) — un bump de surface n'atteindrait pas Heston.
+                    Rapporté par unité de σ décimal (raw).
+      theta       : T − 1 jour (forward, annualisé), comme les vanilles.
+
+    params Heston explicites (calibrés, cachés par ticker) + seed fixe → tous
+    les repricings partagent les mêmes tirages → Greeks stables (pas de bruit MC).
+    """
+    from dataclasses import replace as _dc_replace
+
+    params   = get_heston_params(snap)                       # calibré (caché par ticker)
+    seed     = spec.seed if spec.seed is not None else 12345  # commun à tous les bumps
+    barriers = _autocall_inception_barriers(spec)
+    S        = snap.spot
+    dS       = S * dS_frac
+
+    def f(S0, par, Tloc, snp=None):
+        return _price_autocall(spec, snp if snp is not None else snap,
+                               S0, Tloc, par, seed, barriers)
+
+    p0   = f(S,      params, T)
+    p_su = f(S + dS, params, T)
+    p_sd = f(S - dS, params, T)
+    delta = (p_su - p_sd) / (2 * dS)
+    gamma = (p_su - 2 * p0 + p_sd) / (dS ** 2)
+
+    vol_v0 = math.sqrt(max(params.v0,    0.0))
+    vol_th = math.sqrt(max(params.theta, 0.0))
+    par_up = _dc_replace(params, v0=(vol_v0 + dvol) ** 2, theta=(vol_th + dvol) ** 2)
+    par_dn = _dc_replace(params, v0=max(vol_v0 - dvol, 1e-4) ** 2,
+                                 theta=max(vol_th - dvol, 1e-4) ** 2)
+    p_vu = f(S, par_up, T)
+    p_vd = f(S, par_dn, T)
+    vega  = (p_vu - p_vd) / (2 * dvol)            # par unité de σ décimal (raw)
+    vomma = (p_vu - 2 * p0 + p_vd) / (dvol ** 2)  # convexité de vega (vol gamma)
+
+    # Rho -- bump taux CENTRE via courbe OIS décalée (drift ET actualisation)
+    dr   = 1e-4
+    p_ru = f(S, params, T, _BumpedMarket(snap, rate_bump=+dr))
+    p_rd = f(S, params, T, _BumpedMarket(snap, rate_bump=-dr))
+    rho  = (p_ru - p_rd) / (2 * dr)
+
+    # Theta -- décalage calendaire CENTRÉ (± 1 jour)
+    dT     = 1.0 / 365.0
+    T_dn   = max(T - dT, 1e-6)
+    T_up   = T + dT
+    p_T_dn = f(S, params, T_dn)
+    p_T_up = f(S, params, T_up)
+    theta  = (p_T_dn - p_T_up) / (T_up - T_dn)    # annualisé, centré
+
+    return {
+        "delta":    float(delta),
+        "gamma":    float(gamma),
+        "vega":     float(vega),
+        "vomma":    float(vomma),
+        "rho":      float(rho),
+        "theta":    float(theta),
+        "price_up": float(p_su),
+        "price_dn": float(p_sd),
     }
 
 
@@ -443,14 +566,20 @@ def _compute_pnl_attribution(df_pos: pd.DataFrame) -> pd.DataFrame:
     pnl_delta       = delta(t-1) * dS * quantity
     pnl_gamma       = 0.5 * gamma(t-1) * dS**2 * quantity
     pnl_vega        = vega(t-1) * dvol * quantity
+    pnl_rho         = rho(t-1) * dr * quantity
     pnl_theta       = theta(t-1) * dT * quantity
-    pnl_unexplained = pnl - (pnl_delta + pnl_gamma + pnl_vega + pnl_theta)
+    pnl_unexplained = pnl - (pnl_delta + pnl_gamma + pnl_vega + pnl_rho + pnl_theta)
 
     Chocs
     -----
     dS   = spot(t) - spot(t-1)
     dvol = realized_vol(t) - realized_vol(t-1)   (decimal)
+    dr   = rate(t) - rate(t-1)                   (niveau de taux)
     dT   = T_residual(t-1) - T_residual(t)       (annees, > 0)
+
+    Note rho : la courbe OIS est constante sur le backtest (un seul fetch),
+    donc dr = 0 et pnl_rho ≈ 0 tant que des taux historiques par date ne sont
+    pas chargés. Le Greek rho lui-même reste informatif (sensibilité par date).
 
     Notes
     -----
@@ -473,11 +602,15 @@ def _compute_pnl_attribution(df_pos: pd.DataFrame) -> pd.DataFrame:
         delta_prev     = grp["delta"].shift(1)
         gamma_prev     = grp["gamma"].shift(1)
         vega_prev      = grp["vega"].shift(1)
+        vomma_prev     = grp["vomma"].shift(1)
+        rho_prev       = grp["rho"].shift(1)
         theta_prev     = grp["theta"].shift(1)
+        rate_prev      = grp["rate"].shift(1)
 
         # Chocs
         dS   = grp["spot"]         - spot_prev
         dvol = grp["realized_vol"] - vol_prev
+        dr   = grp["rate"]         - rate_prev   # variation du niveau de taux
         dT   = T_prev              - grp["T_residual"]  # > 0
 
         # P&L total
@@ -486,8 +619,10 @@ def _compute_pnl_attribution(df_pos: pd.DataFrame) -> pd.DataFrame:
         # Composants expliques
         grp["pnl_delta"] = delta_prev * dS              * qty
         grp["pnl_gamma"] = 0.5 * gamma_prev * (dS ** 2) * qty
-        grp["pnl_vega"]  = vega_prev  * dvol            * qty
-        grp["pnl_theta"] = theta_prev * dT              * qty
+        grp["pnl_vega"]  = vega_prev  * dvol             * qty
+        grp["pnl_vomma"] = 0.5 * vomma_prev * (dvol ** 2) * qty
+        grp["pnl_rho"]   = rho_prev   * dr               * qty
+        grp["pnl_theta"] = theta_prev * dT               * qty
 
         # Residuel -- NaN si un composant est NaN (greques absentes ou premiere date)
         grp["pnl_unexplained"] = (
@@ -495,6 +630,8 @@ def _compute_pnl_attribution(df_pos: pd.DataFrame) -> pd.DataFrame:
             - grp["pnl_delta"]
             - grp["pnl_gamma"]
             - grp["pnl_vega"]
+            - grp["pnl_vomma"]
+            - grp["pnl_rho"]
             - grp["pnl_theta"]
         )
 
@@ -677,26 +814,38 @@ class BacktestEngine:
                     "spot":         spot_hist,
                     "T_residual":   round(T, 6),
                     "realized_vol": round(realized_vol, 6),
+                    "rate":         round(snap.r, 6),     # niveau de taux (pour pnl_rho)
                     "mtm":          mtm,
                     "quantity":     qty,
                     "nominal":      spec.nominal,
                     "mtm_total":    mtm_total,
+                    "price_up":     float("nan"),
+                    "price_dn":     float("nan"),
                     "delta":        float("nan"),
                     "gamma":        float("nan"),
                     "vega":         float("nan"),
+                    "vomma":        float("nan"),
+                    "rho":          float("nan"),
                     "theta":        float("nan"),
                 }
 
-                # Greques -- mode AL uniquement
+                # Greques : vanilles/certificats en AL (différences finies sur
+                # la surface) ; autocalls via bump & reprice MC dédié (coupon
+                # figé, barrières figées, params Heston bumpés pour le vega).
                 if (
                     self.compute_greeks
-                    and spec.mode == "AL"
                     and not math.isnan(mtm)
                     and T > 1.0 / 365.0
                 ):
                     try:
-                        g = _compute_greeks(spec, snap, T, mtm)
-                        row.update(g)
+                        if spec.is_autocall:
+                            g = _autocall_greeks(spec, snap, T)
+                        elif spec.mode == "AL":
+                            g = _compute_greeks(spec, snap, T, mtm)
+                        else:
+                            g = None
+                        if g:
+                            row.update(g)
                     except Exception as e:
                         if self.verbose:
                             print(
@@ -743,12 +892,14 @@ class BacktestEngine:
 
         mode custom_weights : greques ponderees par les poids fournis.
         """
-        greek_cols = ["delta", "gamma", "vega", "theta"]
+        greek_cols = ["delta", "gamma", "vega", "vomma", "rho", "theta"]
         pnl_cols   = [
             "pnl",
             "pnl_delta",
             "pnl_gamma",
             "pnl_vega",
+            "pnl_vomma",
+            "pnl_rho",
             "pnl_theta",
             "pnl_unexplained",
         ]

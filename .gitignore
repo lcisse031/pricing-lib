@@ -19,3 +19,4 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+pricing_lib/market_data/.vol_cache/
