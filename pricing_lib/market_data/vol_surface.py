@@ -850,4 +850,70 @@ def build_surface(ticker: str, spot: float) -> VolSurface:
     return surf
 
 
-def comp
+def compute_dupire_surface(
+    surf: VolSurface,
+    tenors: Optional[np.ndarray] = None,
+    strikes: Optional[np.ndarray] = None,
+) -> pd.DataFrame:
+    """Compute local vol surface via Dupire."""
+    if tenors is None:
+        tenors = surf.tenors
+    if strikes is None:
+        strikes = surf.strikes
+
+    records = []
+    for T in tenors:
+        for K in strikes:
+            loc_vol = dupire_local_vol(surf, T, K)
+            records.append({"T": T, "K": K, "local_vol": loc_vol})
+
+    return pd.DataFrame(records)
+
+
+# ─── helpers ───────────────────────────────────────────────────────────────────
+
+def _pf(s) -> Optional[float]:
+    """Parse float from string."""
+    if s is None:
+        return None
+    s = str(s).strip().replace(",", ".")
+    if s in ("-", "", "—", "N/A"):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _third_friday(year: int, month: int) -> date:
+    """
+    Retourne le 3ème vendredi du mois — date d'échéance standard Euronext
+    pour les options sur actions (STO).
+    """
+    weeks = calendar.monthcalendar(year, month)   # listes [Lun..Dim]
+    # index 4 = vendredi ; on filtre les semaines où vendredi ≠ 0
+    fridays = [w[4] for w in weeks if w[4] != 0]
+    return date(year, month, fridays[2])          # 3ème vendredi
+
+
+def _parse_maturity_to_yyyy_mm(s: str) -> str:
+    """Parse maturity label → YYYY-MM."""
+    s = s.strip()
+
+    if "-" in s:
+        parts = s.split("-")
+        if len(parts) == 3:
+            try:
+                day, month, year = parts
+                return f"{year}-{month.zfill(2)}"
+            except (ValueError, TypeError):
+                pass
+
+    parts = s.split()
+    if len(parts) >= 2:
+        month_str = parts[0][:3].capitalize()
+        year = parts[-1]
+        month_num = _MONTH_FR.get(month_str, "??")
+        return f"{year}-{month_num}"
+
+    return s
