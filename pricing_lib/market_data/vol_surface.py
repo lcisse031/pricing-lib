@@ -65,14 +65,10 @@ _TICKER_MAP = {
     "CA":    "CA4",    # Carrefour
     "ACA":   "CR4",   # Crédit Agricole
     "BN":    "BN4",    # Danone
-
-    # --- Luxe & Cosmétiques ---
     "MC":    "MC4",    # LVMH
     "RMS":   "HE4",   # Hermès International
     "OR":    "OR4",    # L'Oréal
     "KER":   "KR4",   # Kering
-
-    # --- Industrie & Aéronautique ---
     "SAF":   "SM4",   # Safran
     "HO":    "HO4",    # Thales
     "SU":    "SU4",    # Schneider Electric
@@ -80,48 +76,23 @@ _TICKER_MAP = {
     "LR":    "LR4",    # Legrand
     "MT":    "MT9",    # ArcelorMittal
     "STMPA": "STM4",   # STMicroelectronics
-
-    # --- Finance & Assurance ---
-    "CS":    "CS4",    # AXA
-
-    # --- Énergie ---
     "TTE":   "TO4",   # TotalEnergies
     "ENGI":  "ENGI4",  # Engie
-    "VIE":   "VIE4",   # Veolia Environnement
-
-    # --- Santé ---
     "SAN":   "ZA4",   # Sanofi
     "EL":    "EL4",    # EssilorLuxottica
     "ERF":   "ERF4",   # Eurofins Scientific
-
-    # --- BTP & Concessions ---
     "DG":    "DG4",    # Vinci
     "FGR":   "FGR4",   # Eiffage
-
-    # --- Automobile ---
     "STLAP": "STL4",   # Stellantis
     "ML":    "ML4",    # Michelin
-    "RNO":   "RN4",   # Renault
-
-    # --- Technologie ---
     "DSY":   "DS4",   # Dassault Systèmes
     "CAP":   "CP4",   # Capgemini
-
-    # --- Agroalimentaire ---
     "RI":    "RI4",    # Pernod Ricard
-
-    # --- Télécoms ---
     "ORA":   "FT4",   # Orange
-
-    # --- Services ---
     "BVI":   "BVI4",   # Bureau Veritas
     "PUB":   "PU4",   # Publicis Groupe
     "ENX":   "ENX4",   # Euronext
-
-    # --- Hôtellerie & Distribution ---
     "AC":    "AC4",    # Accor
-
-    # --- Immobilier ---
     "URW":   "UB9",   # Unibail-Rodamco-Westfield
 }
 
