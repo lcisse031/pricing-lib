@@ -14,32 +14,12 @@ calibrate_heston()    — calibration sur VolSurface (DE + L-BFGS-B)
 heston_simulate()     — simulation MC terminale (payoffs vanilles)
 heston_simulate_paths()— simulation MC chemin complet (produits path-dep.)
 
-Optimisations v2
-────────────────
-• heston_price    : quad → np.trapz sur grille fixe ; heston_cf est vectorisé
-                    sur u (numpy), élimine ~200× le surcoût Python/appel.
-• _heston_call_vec: évalue simultanément tous les strikes pour un tenor ;
-                    utilisé dans calibrate_heston pour supprimer la boucle K.
-• calibrate_heston: objectif pré-calcule les prix de marché + normalisation
-                    vega → zéro appel brentq dans la boucle interne.
-                    maxiter DE 100→50, polishing désactivé en DE.
-• heston_simulate : n_steps par défaut 252→100 /an (suffisant en terminal).
-
-Optimisations v3
-────────────────
-• _cf_static / _cf_finish : la CF Heston est décomposée en deux phases.
-  Phase statique  _cf_static(u, params) : calcule d, g, coef — dépend de u
-                  et des params, PAS de T. Résultat réutilisable sur tous les
-                  tenors pour un même jeu de paramètres.
-  Phase dynamique _cf_finish(u, d, g, coef, S, v0, r, q, T, kappa, theta,
-                  sigma_v) : ne calcule que les termes en exp(-d·T) et le
-                  log restant.
-• calibrate_heston : _cf_static est appelé UNE SEULE FOIS par évaluation
-                  d'objectif (hors boucle tenor), puis _cf_finish est appelé
-                  par tenor (5×). Économie : ~(n_T - 1) × 2 sqrt complexe
-                  par éval, soit ~80 % du coût CF éliminé.
-• Grille u réduite 200 → 128 points (précision identique pour la calibration).
-• Exponentielles scalaires (exp(-q·T), etc.) pré-calculées hors objectif.
+Notes d'implémentation
+──────────────────────
+• Intégration de Gil-Pelaez par trapèzes sur une grille u fixe (128 points),
+  CF vectorisée sur u et sur les strikes.
+• La CF est séparée en une partie indépendante de T (_cf_static) et une
+  partie par tenor (_cf_finish) pour accélérer la calibration.
 """
 
 from __future__ import annotations
@@ -146,8 +126,7 @@ def heston_cf(
         one_minus_g_exp = 1.0 - g * exp_dT
         one_minus_g     = 1.0 - g
 
-        # NB : la dérive (r−q) est déjà portée par x = ln S + (r−q)T (terme i·u·x).
-        # Ne PAS la rajouter ici sinon double comptage (φ(−i) ≠ E[S_T], prix biaisés).
+        # la dérive (r−q) est déjà dans x
         C = (kappa * theta / sigma_v ** 2) * (
             (kappa - rho * sigma_v * 1j * u - d) * T
             - 2.0 * np.log((one_minus_g_exp + eps) / (one_minus_g + eps))
@@ -228,16 +207,12 @@ def _cf_finish(
     --------
     np.ndarray complexe (N,) — valeurs de la CF
     """
-    # Garde-fous numériques : sur des params dégénérés (calibration sur surface
-    # pauvre/plate), one_minus_g_exp ou (1−g) peuvent friser 0 → log(0)/div 0.
-    # eps complexe + np.errstate évitent un crash (certains environnements
-    # remontent les warnings numpy en erreurs).
-    eps = 1e-300
+    eps = 1e-300   # params dégénérés : évite log(0) et division par 0
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
         x               = np.log(S) + (r - q) * T
         exp_dT          = np.exp(-d * T)
         one_minus_g_exp = 1.0 - g * exp_dT
-        # (r−q) déjà dans x = ln S + (r−q)T — pas de double comptage ici.
+
         C = (kappa * theta / sigma_v ** 2) * (
             coef * T - 2.0 * np.log((one_minus_g_exp + eps) / (1.0 - g + eps))
         )
@@ -454,8 +429,8 @@ def calibrate_heston(
     t_idx  = np.sort(top5_t)
     tenors = tenors_all[t_idx]
 
-    # 5 strikes par moneyness cible {0.90, 0.95, 1.00, 1.05, 1.10}
-    target_m  = [0.90, 0.95, 1.00, 1.05, 1.10]
+    # 7 strikes entre 80 % et 120 % : les ailes sont nécessaires pour contraindre ρ
+    target_m  = [0.80, 0.90, 0.95, 1.00, 1.05, 1.10, 1.20]
     K_targets = np.array([m * S for m in target_m])
     strikes   = K_targets
 
@@ -469,9 +444,7 @@ def calibrate_heston(
         mkt_vols[i] = np.interp(K_targets, strikes_all[valid], row[valid])
 
     # ── Ancrage ATM : v0 ≈ variance ATM courte, θ ≈ variance ATM longue ────────
-    # (approche desk : on pin le NIVEAU de variance aux vols ATM observables ;
-    # seule la FORME du smile — σ_v, ρ — est laissée libre au calibrateur).
-    _atm_col = 2   # moneyness 1.00 dans target_m
+    _atm_col = int(np.argmin(np.abs(np.asarray(target_m) - 1.0)))  # colonne ATM
     _atm = np.array([mkt_vols[i, _atm_col] if (np.isfinite(mkt_vols[i, _atm_col])
                      and mkt_vols[i, _atm_col] > 0) else np.nan
                      for i in range(len(tenors))])
@@ -481,17 +454,16 @@ def calibrate_heston(
     v_front = min(max(v_front, 0.0025), 0.39)   # vol ATM bornée ∈ [5 %, ~62 %]
     v_back  = min(max(v_back,  0.0025), 0.39)
 
-    # ── Pondération gaussienne ATM ────────────────────────────────────────────
+    # ── Pondération gaussienne en log-moneyness ───────────────────────────────
     moneyness = strikes / S
-    w_k = np.exp(-2.0 * np.log(moneyness) ** 2)       # (n_K_sub,)
+    w_k = np.exp(-1.0 * np.log(moneyness) ** 2)       # (n_K_sub,)
     w_mat = np.outer(np.ones(len(tenors)), w_k)        # (n_T_sub, n_K_sub)
 
     # ── Pré-calcul hors boucle : prix et vega de marché ──────────────────────
-    # (une seule fois, pas à chaque évaluation de l'objectif)
     sqrt_2pi = math.sqrt(2.0 * math.pi)
     mkt_prices  = np.zeros_like(mkt_vols)
     vega_norm   = np.zeros_like(mkt_vols)
-    w_sigma     = np.ones_like(mkt_vols)   # correction 6 : poids niveau de vol
+    w_sigma     = np.ones_like(mkt_vols)
 
     for i, T in enumerate(tenors):
         if T <= 0:
@@ -511,7 +483,7 @@ def calibrate_heston(
             else:
                 mkt_prices[i, j] = call_mkt
             vega_norm[i, j]  = max(fwd_S * sqrt_T * math.exp(-0.5 * d1 ** 2) / sqrt_2pi, 1e-4)
-            w_sigma[i, j]    = 1.0 / (1.0 + sv)   # correction 6
+            w_sigma[i, j]    = 1.0 / (1.0 + sv)
 
     # Pré-calcul des exponentielles scalaires par tenor (hors objectif)
     tenor_fwd_S = np.array([S * math.exp(-q * T) for T in tenors])       # (n_T,)
@@ -537,20 +509,16 @@ def calibrate_heston(
 
             # ── Pénalité Feller : λ·max(0, σ_v² − 2κθ)² ──────────────────────
             feller_viol = max(0.0, sigma_v ** 2 - 2.0 * kappa * theta)
-            penalty = 15.0 * feller_viol ** 2   # λ=15 : moins bloquant que 50
+            penalty = 15.0 * feller_viol ** 2
 
-            # Ancrage ATM (fort) : v0 et θ collés aux variances ATM de marché.
-            # Empêche le niveau de partir en vrille sur surface pauvre/plate.
+            # Ancrage de v0 et θ aux variances ATM
             penalty += 50.0 * ((v0 - v_front) ** 2 + (theta - v_back) ** 2)
 
-            # Prior doux sur la FORME du smile (σ_v, ρ) et la vitesse κ : n'agit
-            # que si la surface ne les contraint pas (cas plat → κ indéterminé
-            # quand v0=θ) → évite les paramètres aux bornes.
-            penalty += 0.5 * ((sigma_v - 0.40) ** 2 + (rho + 0.50) ** 2)
+            # Prior léger sur σ_v, ρ et κ (évite les bornes sur surface pauvre)
+            penalty += 0.02 * (sigma_v - 0.40) ** 2 + 0.008 * (rho + 0.50) ** 2
             penalty += 0.002 * (kappa - 3.0) ** 2
 
-            # Régularisation : pénalise les sauts vs la calibration précédente
-            # (stabilité jour à jour façon desk).
+            # Stabilité jour à jour par rapport à la calibration précédente
             if prev_params is not None and reg_weight > 0.0:
                 penalty += reg_weight * float(np.sum((x - prev_params.to_array()) ** 2))
 
@@ -576,7 +544,7 @@ def calibrate_heston(
                 w_T = 1.0 / max(T, 0.05)   # pondération maturité
                 residuals = (
                     w_mat[i][valid]
-                    * w_sigma[i][valid]                              # correction 6
+                    * w_sigma[i][valid]
                     * (model_prices[valid] - mkt_prices[i][valid])
                     / vega_norm[i][valid]
                 )
@@ -592,13 +560,12 @@ def calibrate_heston(
     bounds = [
         (0.50, 25.0),    # kappa
         (0.01,  1.0),    # theta
-        (0.05,  1.50),   # sigma_v — resserré [0.05, 1.5]
-        (-0.95, -0.30),  # rho     — skew marqué forcé
+        (0.05,  1.50),   # sigma_v
+        (-0.95, -0.30),  # rho
         (0.01,  0.40),   # v0
     ]
 
-    # Initialisation ancrée sur l'ATM : v0=variance ATM courte, θ=variance ATM
-    # longue (warm-start si une calibration précédente est fournie).
+    # Départ ancré sur l'ATM, ou sur la calibration précédente
     x0 = (prev_params.to_array() if prev_params is not None
           else np.array([4.0, v_back, 0.40, -0.50, v_front]))
 
@@ -912,6 +879,21 @@ def heston_simulate_paths(
             paths[:, obs_map[t]] = np.exp(log_S)
 
     return observation_times, paths
+
+
+# ─── Choc de niveau de vol sur des paramètres Heston ─────────────────────────
+
+def shift_heston_vol(params: HestonParams, dv: float) -> HestonParams:
+    """
+    Choc de niveau de vol : √v0 → √v0 + dv et √θ → √θ + dv
+    (même convention que le vega Heston).
+    """
+    if not dv:
+        return params
+    from dataclasses import replace
+    v0 = max(math.sqrt(max(params.v0, 0.0)) + dv, 1e-3) ** 2
+    th = max(math.sqrt(max(params.theta, 0.0)) + dv, 1e-3) ** 2
+    return replace(params, v0=v0, theta=th)
 
 
 # ─── Paramètres par défaut (desk) ─────────────────────────────────────────────

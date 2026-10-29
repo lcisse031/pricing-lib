@@ -4,9 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pricing-lib"
-version = "0.1.0"
+version = "0.2.0"
+description = "Pricing et risque de produits structurés actions (BS, Heston MC, SSVI, backtest P&L)"
+readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pandas>=2.0",
+    "python-dateutil>=2.8",
+    "requests>=2.31",
+    "beautifulsoup4>=4.12",
+    "yfinance>=0.2.40",
+]
+
+[project.optional-dependencies]
+# Scraping des dividendes zonebourse (navigateur headless)
+scraping = ["playwright>=1.40"]
+# Graphiques de surface de vol (VolSurface.plot)
+plot = ["matplotlib>=3.7"]
+dev = ["pytest>=7.4"]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["pricing_lib*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

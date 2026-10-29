@@ -43,7 +43,11 @@ from pricing_lib.market_data.market_snapshot import MarketSnapshot
 from pricing_lib.market_data.vol_surface import VolSurface
 from pricing_lib.pricers.analytical import AnalyticalPricer
 from pricing_lib.pricers.mc import MCPricer, get_heston_params
-from pricing_lib.pricers.autocalls import PhoenixPricer, AthenaPricer
+from dataclasses import replace
+
+from pricing_lib.pricers.autocalls import (
+    PhoenixPricer, AthenaPricer, barrier_level, _observation_dates,
+)
 from pricing_lib.risk.greeks import _BumpedMarket   # courbe OIS décalée (rho complet)
 
 
@@ -212,57 +216,147 @@ class _BumpedSnap:
 
 def _autocall_inception_barriers(spec: PositionSpec) -> tuple:
     """
-    Barrières ABSOLUES figées au spot d'inception (spec.spot).
-
-    Dans un backtest, les barrières d'un autocall sont fixées à la signature
-    du trade — elles NE doivent PAS être re-strikées au spot courant chaque
-    jour (sinon le produit reste à moneyness constante → MtM figé, delta nul).
-
-    Retourne (Bc, Br, Bk) en niveaux absolus (Bc = 0 pour Athena).
+    Barrières absolues (Bc, Br, Bk) fixées au spot d'inception.
+    Bc = 0 pour l'Athena.
     """
     p  = spec.params
     S0 = float(spec.spot)
-
-    def _abs(x):
-        return x * S0 if (x is not None and x < 10) else x
-
-    Bc = _abs(p.get("barrier_coupon", 0.0)) if "barrier_coupon" in p else 0.0
-    Br = _abs(p["barrier_recall"])
-    Bk = _abs(p["capital_barrier"])
+    Bc = barrier_level(p["barrier_coupon"], S0) if "barrier_coupon" in p else 0.0
+    Br = barrier_level(p["barrier_recall"], S0)
+    Bk = barrier_level(p["capital_barrier"], S0)
     return Bc, Br, Bk
 
 
-def _price_autocall(spec: PositionSpec, snap, S0: float, T: float,
-                    params, seed, barriers: tuple) -> float:
+def _autocall_pricer_for(spec: PositionSpec, snap, S: float, params, seed,
+                         barriers: tuple, mode: str = "MC", coupon: Optional[float] = None,
+                         valuation_date: Optional[date] = None, n_paths: Optional[int] = None):
     """
-    Price un autocall (phoenix/athena) en MC Heston avec :
-      • S0 explicite (le spot, éventuellement bumpé pour delta/gamma),
-      • barrières ABSOLUES figées (barriers),
-      • params Heston explicites (None → calibration cachée par ticker),
-      • coupon = celui du spec (figé), seed fixe → bump & reprice stable.
-    Retourne le prix unitaire (% du nominal).
+    Pricer d'autocall en cours de vie : échéancier du trade, référence S0 au
+    spot d'inception, simulation depuis le spot courant S.
     """
     p = spec.params
     Bc, Br, Bk = barriers
-    mat_months = max(1, round(T * 12))
+    common = dict(
+        snapshot=snap, n_paths=n_paths or spec.n_paths,
+        start_date=_parse_date(spec.start_date), S0=float(spec.spot),
+        freq_months=int(p.get("freq_months", 3)),
+        maturity_months=_parse_tenor_months(spec.maturity),
+        kg=p.get("kg", "no"), mode=mode,
+        coupon=float(p.get("coupon", 0.0) if coupon is None else coupon),
+        compute_greeks=False, params=params, seed=seed,
+        valuation_date=valuation_date or snap.valuation_date, spot=S,
+    )
     if spec.product_type == "phoenix":
-        return PhoenixPricer(
-            snapshot=snap, n_paths=spec.n_paths, start_date=snap.valuation_date,
-            S0=S0, barrier_coupon=Bc, barrier_recall=Br, capital_barrier=Bk,
-            freq_months=int(p.get("freq_months", 3)), maturity_months=mat_months,
-            kg=p.get("kg", "no"), autocall_start=int(p.get("autocall_start", 0)),
-            mode="MC", coupon=float(p.get("coupon", 0.0)),
-            compute_greeks=False, params=params, seed=seed,
-        ).price().price
-    else:  # athena
-        return AthenaPricer(
-            snapshot=snap, n_paths=spec.n_paths, start_date=snap.valuation_date,
-            S0=S0, barrier_recall=Br, capital_barrier=Bk,
-            freq_months=int(p.get("freq_months", 3)), maturity_months=mat_months,
-            kg=p.get("kg", "no"),
-            mode="MC", coupon=float(p.get("coupon", 0.0)),
-            compute_greeks=False, params=params, seed=seed,
-        ).price().price
+        return PhoenixPricer(barrier_coupon=Bc, barrier_recall=Br, capital_barrier=Bk,
+                             autocall_start=int(p.get("autocall_start", 0)), **common)
+    return AthenaPricer(barrier_recall=Br, capital_barrier=Bk, **common)
+
+
+def _price_autocall(spec: PositionSpec, snap, S: float, params, seed,
+                    barriers: tuple, valuation_date: Optional[date] = None) -> float:
+    """Prix MC (en % du nominal) d'un autocall vivant, coupon figé du spec."""
+    try:
+        return _autocall_pricer_for(spec, snap, S, params, seed, barriers,
+                                    valuation_date=valuation_date).price().price
+    except ValueError:
+        return 0.0
+
+
+def _autocall_history(spec: PositionSpec, spots: dict, d: date) -> tuple:
+    """
+    Rejoue les fixings passés (dates d'observation ≤ d) sur les spots
+    historiques. Retourne (vivant, cash reçu en % du nominal).
+    """
+    p = spec.params
+    S0 = float(spec.spot)
+    Bc, Br, Bk = _autocall_inception_barriers(spec)
+    c  = float(p.get("coupon", 0.0))
+    kg = p.get("kg", "no").lower() == "yes"
+    dates, _ = _observation_dates(_parse_date(spec.start_date),
+                                  int(p.get("freq_months", 3)),
+                                  _parse_tenor_months(spec.maturity))
+    n = len(dates)
+    ac_start = int(p.get("autocall_start", 0))
+    cash = 0.0
+    for k, od in enumerate(dates):
+        if od > d:
+            return True, cash
+        Sk = _nearest_spot(spots, od)
+        if Sk is None:
+            continue
+        last = (k == n - 1)
+        if spec.product_type == "phoenix":
+            if not last and k >= ac_start and Sk > Br:
+                return False, cash + 100.0 * (1.0 + c)
+            if Sk > Bc:
+                cash += 100.0 * c
+            if last:
+                cash += 100.0 if (kg or Sk >= Bk) else 100.0 * Sk / S0
+                return False, cash
+        else:  # athena
+            if not last and Sk > Br:
+                return False, cash + 100.0 * (1.0 + (k + 1) * c)
+            if last:
+                if kg or Sk >= Bk:
+                    cash += 100.0 * (1.0 + n * c)
+                else:
+                    cash += 100.0 * Sk / S0
+                return False, cash
+    return False, cash
+
+
+def _inception_terms(spec: PositionSpec, snap0) -> PositionSpec:
+    """
+    Termes du produit fixés à la date de départ : coupon et cap du RC,
+    participation des certificats, coupon d'autocall s'il n'est pas fourni.
+    """
+    p  = dict(spec.params)
+    pt = spec.product_type
+    start = _parse_date(spec.start_date)
+    T0 = _initial_T(spec)
+    if pt in ("rc", "reverse_convertible"):
+        p.setdefault("cap", float(spec.spot))
+        if "coupon" not in p:
+            p["coupon"] = AnalyticalPricer(snap0).reverse_convertible(
+                cap=p["cap"], T=T0, freq=p.get("freq", "A"),
+                nominal=p.get("nominal", 100.0), start=start).fair_coupon
+    elif pt in ("discount", "discount_certificate"):
+        p.setdefault("X", p.get("cap", float(spec.spot)))
+    elif pt in _PARTICIPATION and "part" not in p:
+        pr = AnalyticalPricer(snap0) if spec.mode == "AL" else MCPricer(snap0, spec.n_paths, seed=spec.seed)
+        p["part"] = _price_participation(pr, pt, p, T0).fair_participation
+    elif spec.is_autocall and "coupon" not in p:
+        barriers = _autocall_inception_barriers(spec)
+        p["coupon"] = _autocall_pricer_for(
+            spec, snap0, float(spec.spot), None, spec.seed, barriers, mode="AL",
+            coupon=0.0).price().fair_coupon
+    return replace(spec, params=p)
+
+
+def _initial_T(spec: PositionSpec) -> float:
+    """Maturité à la date de départ (jours / 365, comme la boucle principale)."""
+    start = _parse_date(spec.start_date)
+    return max((_maturity_date(start, spec.maturity) - start).days / 365.0, 1e-4)
+
+
+_PARTICIPATION = {
+    "twin_win", "twin_win_certificate", "airbag", "airbag_certificate",
+    "sprint", "sprint_certificate", "outperformance", "outperformance_certificate",
+    "garantie", "garantie_certificate",
+}
+
+
+def _price_participation(pr, pt: str, p: dict, T: float):
+    part = p.get("part")
+    if pt in ("twin_win", "twin_win_certificate"):
+        return pr.twin_win_certificate(p["X"], p["B"], T, part=part)
+    if pt in ("airbag", "airbag_certificate"):
+        return pr.airbag_certificate(p["X"], p["B"], T, part=part)
+    if pt in ("sprint", "sprint_certificate"):
+        return pr.sprint_certificate(p["X"], p["cap_level"], T, part=part)
+    if pt in ("outperformance", "outperformance_certificate"):
+        return pr.outperformance_certificate(p["X"], T, part=part)
+    return pr.garantie_certificate(p["X"], T, p.get("nominal", 100.0), part=part)
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +365,7 @@ def _price_autocall(spec: PositionSpec, snap, S0: float, T: float,
 
 def _price_position(spec: PositionSpec, snap: MarketSnapshot, T: float) -> float:
     """
-    Price une position. Retourne le prix unitaire (MtM par unite).
+    Price une position avec les termes du spec. Retourne le prix unitaire.
     T : maturite residuelle en annees.
     """
     if T <= 0:
@@ -280,85 +374,37 @@ def _price_position(spec: PositionSpec, snap: MarketSnapshot, T: float) -> float
     p  = spec.params
     pt = spec.product_type
 
-    if spec.mode == "AL":
-        pr = AnalyticalPricer(snap)
-        if pt in ("call",):
-            return pr.call(p["strike"], T).price
-        elif pt in ("put",):
-            return pr.put(p["strike"], T).price
-        elif pt in ("warrant",):
-            return pr.warrant_product(p.get("flag", "c"), p["strike"], T,
-                                      p.get("ratio", 1.0)).price
-        elif pt in ("rc", "reverse_convertible"):
-            return pr.reverse_convertible(
-                cap=p.get("cap", snap.spot), T=T,
-                freq=p.get("freq", "A"),
-                nominal=p.get("nominal", 100.0),
-                ratio=p.get("ratio", 1.0),
-                start=snap.valuation_date,
-            ).price
-        elif pt in ("bonus", "bonus_certificate"):
-            return pr.bonus_certificate(p["X"], p["B"], T).price
-        elif pt in ("reverse_bonus", "reverse_bonus_certificate"):
-            return pr.reverse_bonus_certificate(p["X"], p["B"], T).price
-        elif pt in ("twin_win", "twin_win_certificate"):
-            return pr.twin_win_certificate(p["X"], p["B"], T).price
-        elif pt in ("airbag", "airbag_certificate"):
-            return pr.airbag_certificate(p["X"], p["B"], T).price
-        elif pt in ("discount", "discount_certificate"):
-            cap_val = p.get("X", p.get("cap", snap.spot))
-            return pr.discount_certificate(cap_val, T).price
-        elif pt in ("sprint", "sprint_certificate"):
-            return pr.sprint_certificate(p["X"], p["cap_level"], T).price
-        elif pt in ("outperformance", "outperformance_certificate"):
-            return pr.outperformance_certificate(p["X"], T).price
-        elif pt in ("garantie", "garantie_certificate"):
-            return pr.garantie_certificate(p["X"], T).price
-        else:
-            raise ValueError(f"product_type '{pt}' non supporte en mode AL.")
+    if pt in ("phoenix", "athena"):
+        # Pas de formule fermée : MC Heston quel que soit spec.mode
+        barriers = _autocall_inception_barriers(spec)
+        return _price_autocall(spec, snap, snap.spot, None, spec.seed, barriers)
 
-    else:  # MC
-        n_paths = spec.n_paths
-        seed    = spec.seed
-
-        if pt in ("phoenix", "athena"):
-            # Barrières FIGÉES au spot d'inception ; S0 = spot du jour (le sous-jacent bouge).
-            barriers = _autocall_inception_barriers(spec)
-            return _price_autocall(spec, snap, snap.spot, T, None, seed, barriers)
-
-        else:
-            mc = MCPricer(snap, n_paths, seed=seed)
-            if pt in ("call",):
-                return mc.call(p["strike"], T).price
-            elif pt in ("put",):
-                return mc.put(p["strike"], T).price
-            elif pt in ("rc", "reverse_convertible"):
-                return mc.reverse_convertible(
-                    cap=p.get("cap", snap.spot), T=T,
-                    freq=p.get("freq", "A"),
-                    nominal=p.get("nominal", 100.0),
-                    ratio=p.get("ratio", 1.0),
-                    start=snap.valuation_date,
-                ).price
-            elif pt in ("bonus", "bonus_certificate"):
-                return mc.bonus_certificate(p["X"], p["B"], T).price
-            elif pt in ("reverse_bonus", "reverse_bonus_certificate"):
-                return mc.reverse_bonus_certificate(p["X"], p["B"], T).price
-            elif pt in ("twin_win", "twin_win_certificate"):
-                return mc.twin_win_certificate(p["X"], p["B"], T).price
-            elif pt in ("airbag", "airbag_certificate"):
-                return mc.airbag_certificate(p["X"], p["B"], T).price
-            elif pt in ("discount", "discount_certificate"):
-                cap_val = p.get("X", p.get("cap", snap.spot))
-                return mc.discount_certificate(cap_val, T).price
-            elif pt in ("sprint", "sprint_certificate"):
-                return mc.sprint_certificate(p["X"], p["cap_level"], T).price
-            elif pt in ("outperformance", "outperformance_certificate"):
-                return mc.outperformance_certificate(p["X"], T).price
-            elif pt in ("garantie", "garantie_certificate"):
-                return mc.garantie_certificate(p["X"], T).price
-            else:
-                raise ValueError(f"product_type '{pt}' non supporte en mode MC.")
+    pr = AnalyticalPricer(snap) if spec.mode == "AL" else MCPricer(snap, spec.n_paths, seed=spec.seed)
+    if pt == "call":
+        return pr.call(p["strike"], T).price
+    if pt == "put":
+        return pr.put(p["strike"], T).price
+    if pt == "warrant":
+        flag, ratio = p.get("flag", "c"), p.get("ratio", 1.0)
+        if spec.mode == "AL":
+            return pr.warrant_product(flag, p["strike"], T, ratio).price
+        return (pr.call if flag == "c" else pr.put)(p["strike"], T, ratio).price
+    if pt in ("rc", "reverse_convertible"):
+        kw = dict(cap=p.get("cap", spec.spot), T=T, freq=p.get("freq", "A"),
+                  nominal=p.get("nominal", 100.0), ratio=p.get("ratio", 1.0),
+                  start=_parse_date(spec.start_date))
+        if spec.mode == "AL":
+            return pr.reverse_convertible(coupon=p.get("coupon"), **kw).price
+        return pr.reverse_convertible(coupon=float(p["coupon"]), **kw).price
+    if pt in ("bonus", "bonus_certificate"):
+        return pr.bonus_certificate(p["X"], p["B"], T).price
+    if pt in ("reverse_bonus", "reverse_bonus_certificate"):
+        return pr.reverse_bonus_certificate(p["X"], p["B"], T).price
+    if pt in ("discount", "discount_certificate"):
+        return pr.discount_certificate(p.get("X", p.get("cap", spec.spot)), T).price
+    if pt in _PARTICIPATION:
+        return _price_participation(pr, pt, p, T).price
+    raise ValueError(f"product_type '{pt}' non supporte.")
 
 
 # ---------------------------------------------------------------------------
@@ -441,18 +487,9 @@ def _autocall_greeks(
     dvol:    float = 0.01,
 ) -> dict:
     """
-    Greeks d'un autocall (phoenix/athena) pour le backtest, par bump & reprice
-    MC à coupon FIGÉ — convention RAW du moteur (cohérente avec _compute_greeks
-    et l'attribution P&L) :
-
-      delta/gamma : S0 ± dS, barrières FIGÉES à l'inception (pas de re-strike).
-      vega        : shift parallèle ±dvol pt de vol sur les PARAMS Heston
-                    (√v0, √θ) — un bump de surface n'atteindrait pas Heston.
-                    Rapporté par unité de σ décimal (raw).
-      theta       : T − 1 jour (forward, annualisé), comme les vanilles.
-
-    params Heston explicites (calibrés, cachés par ticker) + seed fixe → tous
-    les repricings partagent les mêmes tirages → Greeks stables (pas de bruit MC).
+    Greeks d'un autocall pour le backtest (bump & reprice MC, même seed),
+    en unités brutes comme _compute_greeks : vega par unité de σ, theta annualisé.
+    Le vega choque √v0 et √θ dans les paramètres Heston.
     """
     from dataclasses import replace as _dc_replace
 
@@ -462,13 +499,13 @@ def _autocall_greeks(
     S        = snap.spot
     dS       = S * dS_frac
 
-    def f(S0, par, Tloc, snp=None):
+    def f(S_, par, snp=None, val=None):
         return _price_autocall(spec, snp if snp is not None else snap,
-                               S0, Tloc, par, seed, barriers)
+                               S_, par, seed, barriers, valuation_date=val)
 
-    p0   = f(S,      params, T)
-    p_su = f(S + dS, params, T)
-    p_sd = f(S - dS, params, T)
+    p0   = f(S,      params)
+    p_su = f(S + dS, params)
+    p_sd = f(S - dS, params)
     delta = (p_su - p_sd) / (2 * dS)
     gamma = (p_su - 2 * p0 + p_sd) / (dS ** 2)
 
@@ -477,24 +514,22 @@ def _autocall_greeks(
     par_up = _dc_replace(params, v0=(vol_v0 + dvol) ** 2, theta=(vol_th + dvol) ** 2)
     par_dn = _dc_replace(params, v0=max(vol_v0 - dvol, 1e-4) ** 2,
                                  theta=max(vol_th - dvol, 1e-4) ** 2)
-    p_vu = f(S, par_up, T)
-    p_vd = f(S, par_dn, T)
+    p_vu = f(S, par_up)
+    p_vd = f(S, par_dn)
     vega  = (p_vu - p_vd) / (2 * dvol)            # par unité de σ décimal (raw)
     vomma = (p_vu - 2 * p0 + p_vd) / (dvol ** 2)  # convexité de vega (vol gamma)
 
     # Rho -- bump taux CENTRE via courbe OIS décalée (drift ET actualisation)
     dr   = 1e-4
-    p_ru = f(S, params, T, _BumpedMarket(snap, rate_bump=+dr))
-    p_rd = f(S, params, T, _BumpedMarket(snap, rate_bump=-dr))
+    p_ru = f(S, params, _BumpedMarket(snap, rate_bump=+dr))
+    p_rd = f(S, params, _BumpedMarket(snap, rate_bump=-dr))
     rho  = (p_ru - p_rd) / (2 * dr)
 
-    # Theta -- décalage calendaire CENTRÉ (± 1 jour)
-    dT     = 1.0 / 365.0
-    T_dn   = max(T - dT, 1e-6)
-    T_up   = T + dT
-    p_T_dn = f(S, params, T_dn)
-    p_T_up = f(S, params, T_up)
-    theta  = (p_T_dn - p_T_up) / (T_up - T_dn)    # annualisé, centré
+    # Theta -- date de valorisation ± 1 jour
+    vd     = snap.valuation_date
+    p_T_dn = f(S, params, val=vd + timedelta(days=1))
+    p_T_up = f(S, params, val=vd - timedelta(days=1))
+    theta  = (p_T_dn - p_T_up) / (2.0 / 365.0)    # annualisé, centré
 
     return {
         "delta":    float(delta),
@@ -542,8 +577,7 @@ def _compute_initial_mtm(
         div            = div,
         realized_vol   = vol_0,
     )
-    T0 = _parse_tenor_months(spec.maturity) / 12.0
-
+    T0 = _initial_T(spec)
     try:
         return _price_position(spec, snap_0, T0)
     except Exception as e:
@@ -718,6 +752,29 @@ class BacktestEngine:
         if self.verbose:
             print("[Backtest] Calcul des quantites initiales ...")
 
+        # Termes fixés à l'inception, seed fixe pour un MtM MC stable
+        fixed: list = []
+        for spec in self.positions:
+            if spec.seed is None:
+                spec = replace(spec, seed=12345)
+            start_d = self._start_d[spec.product_id]
+            spot_0  = _nearest_spot(spots_by_ticker[spec.ticker], start_d) or spec.spot
+            snap_0  = build_snapshot(spec.ticker, start_d, spot_0,
+                                     ois_by_ticker[spec.ticker], div_by_ticker[spec.ticker],
+                                     vol_by_ticker[spec.ticker].get(start_d, _DEFAULT_VOL))
+            try:
+                spec = _inception_terms(spec, snap_0)
+            except Exception as e:
+                if self.verbose:
+                    print(f"  [WARN] termes d'inception {spec.product_id}: {e}")
+            if self.verbose and spec.params != {}:
+                shown = {k: (round(v, 6) if isinstance(v, float) else v)
+                         for k, v in spec.params.items() if k in ("coupon", "part", "cap")}
+                if shown:
+                    print(f"  {spec.product_id}: termes figés {shown}")
+            fixed.append(spec)
+        self.positions = fixed
+
         qty_by_id: dict = {}
         for spec in self.positions:
 
@@ -777,13 +834,18 @@ class BacktestEngine:
                 if d < start_d or d > mat_date:
                     continue
 
-                T = max((mat_date - d).days / 365.0, 0.0)
+                T = max((mat_date - d).days / 365.0, 1e-4)   # à l'échéance : ≈ payoff
 
                 spot_hist = _nearest_spot(
                     spots_by_ticker.get(spec.ticker, {}), d
                 )
                 if spot_hist is None:
                     continue
+
+
+                alive, cash = True, 0.0
+                if spec.is_autocall:
+                    alive, cash = _autocall_history(spec, spots_by_ticker[spec.ticker], d)
 
                 realized_vol = vol_by_ticker.get(
                     spec.ticker, {}
@@ -799,7 +861,11 @@ class BacktestEngine:
                 )
 
                 try:
-                    mtm = _price_position(spec, snap, T)
+                    if spec.is_autocall:
+                        # flux déjà reçus + valeur des flux restants
+                        mtm = cash + (_price_position(spec, snap, T) if alive else 0.0)
+                    else:
+                        mtm = _price_position(spec, snap, T)
                 except Exception as e:
                     if self.verbose:
                         print(f"\n  [WARN] Price {spec.product_id} {d}: {e}")
@@ -829,21 +895,19 @@ class BacktestEngine:
                     "theta":        float("nan"),
                 }
 
-                # Greques : vanilles/certificats en AL (différences finies sur
-                # la surface) ; autocalls via bump & reprice MC dédié (coupon
-                # figé, barrières figées, params Heston bumpés pour le vega).
+
                 if (
                     self.compute_greeks
                     and not math.isnan(mtm)
                     and T > 1.0 / 365.0
+                    and alive
                 ):
                     try:
                         if spec.is_autocall:
                             g = _autocall_greeks(spec, snap, T)
-                        elif spec.mode == "AL":
-                            g = _compute_greeks(spec, snap, T, mtm)
                         else:
-                            g = None
+
+                            g = _compute_greeks(spec, snap, T, mtm)
                         if g:
                             row.update(g)
                     except Exception as e:

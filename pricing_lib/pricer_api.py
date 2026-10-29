@@ -1,11 +1,11 @@
 """
-pricing_lib/api.py
+pricing_lib/pricer_api.py
 ─────────────────────────────────────────────────────────────────────────────
 Interface publique unifiée du moteur de pricing et de gestion des risques.
 
 Usage — Pricing
 ───────────────
-    from pricing_lib.api import Call, Put, RC, Phoenix, Athena, BonusCertificate
+    from pricing_lib.pricer_api import Call, Put, RC, Phoenix, Athena, BonusCertificate
 
     # Analytique
     Call('AL', 'GLE', 100, 110, '02/05/2026', '3M')
@@ -37,11 +37,11 @@ freq        : fréquence coupons 'M'/'Q'/'S'/'A' (défaut 'A')
 
 Usage — Gestion des risques
 ────────────────────────────
-    from pricing_lib.api import Greeks, Stress, ScenarioGrid, build_snapshot
+    from pricing_lib.pricer_api import Stress, ScenarioGrid, build_snapshot
 
-    # Greeks d'un Call par différences finies centrées
-    g = Greeks('AL', 'GLE', 100, 100, '02/05/2026', '3M', product='call')
-    print(g)   # Delta, Gamma, Vega, Theta, Rho
+    # Greeks : présents dans chaque résultat (result.greeks)
+    res = Call('AL', 'GLE', 100, 100, '02/05/2026', '3M')
+    print(res.greeks)   # delta, gamma, vega, theta, rho
 
     # Stress test multi-scénarios (chocs parallèles spot/vol/taux)
     df = Stress('AL', 'GLE', 100, '02/05/2026', '3M', product='call', K=100)
@@ -68,16 +68,19 @@ from datetime import date, datetime
 from typing import List, Optional
 
 from pricing_lib.market_data.dividends import fetch_dividend, DividendCurve
-from pricing_lib.market_data.rates import fetch_ois_curve
+from pricing_lib.market_data.rates import fetch_ois_curve, flat_ois_curve
+
+_FALLBACK_RATE = 0.02   # taux plat de repli si la courbe €STR est injoignable
 from pricing_lib.market_data.vol_surface import (
     fetch_option_chain, VolSurface, fetch_market_params, dupire_local_vol,
+    load_cached_surface, save_surface_cache,
     _TICKER_MAP as _EURONEXT_MAPPING, _AMSTERDAM_TICKERS,
 )
 from pricing_lib.market_data.market_snapshot import MarketSnapshot
 from pricing_lib.pricers.base import PricingResult
 from pricing_lib.pricers.analytical import AnalyticalPricer
 from pricing_lib.pricers.mc import MCPricer
-from pricing_lib.pricers.autocalls import PhoenixPricer, AthenaPricer
+from pricing_lib.pricers.autocalls import PhoenixPricer, AthenaPricer, barrier_level
 from pricing_lib.risk.greeks import compute_greeks_bs, compute_greeks_fd_vol
 from pricing_lib.risk import (
     StressTest, ScenarioAnalyzer, StressScenario, STANDARD_STRESSES, _ClosurePricer,
@@ -146,10 +149,15 @@ def _build_snapshot(
     if verbose:
         print(f"[Snapshot] Récupération données marché pour {ticker}...")
 
-    # Taux OIS
-    ois = fetch_ois_curve(valuation_date)
-    if verbose:
-        print(f"[Snapshot] OIS curve OK (r_1Y={ois.zero_rate_tau(1.0):.4%})")
+    # Taux OIS (courbe plate si la source ne répond pas)
+    try:
+        ois = fetch_ois_curve(valuation_date)
+        if verbose:
+            print(f"[Snapshot] OIS curve OK (r_1Y={ois.zero_rate_tau(1.0):.4%})")
+    except Exception as e:
+        ois = flat_ois_curve(_FALLBACK_RATE, valuation_date)
+        print(f"[Snapshot] ⚠ Courbe €STR indisponible ({type(e).__name__}) — "
+              f"courbe PLATE {_FALLBACK_RATE:.2%} utilisée.")
 
     # Dividendes
     try:
@@ -166,9 +174,15 @@ def _build_snapshot(
     r_1y         = ois.zero_rate_tau(1.0)
     euronext_sym = _to_euronext_symbol(ticker)
     exchange     = "DAMS" if ticker in _AMSTERDAM_TICKERS else "DPAR"
+    # La chaîne d'options est celle du jour : maturités comptées depuis aujourd'hui
+    data_date = date.today()
+    if verbose and valuation_date != data_date:
+        print(f"[Snapshot] ⚠ Date de valo {valuation_date} ≠ aujourd'hui : les données "
+              f"de marché (vol, taux, dividendes) sont celles du {data_date}.")
     try:
         chain = fetch_option_chain(euronext_sym, exchange)
-        surf  = VolSurface.from_option_chain(chain, valuation_date, spot, r_1y, div.q)
+        surf  = VolSurface.from_option_chain(chain, data_date, spot, r_1y, div.q)
+        save_surface_cache(ticker, surf)
         if verbose:
             # Affiche la vol locale ATM pour 3M et 1Y
             sig_3m = dupire_local_vol(surf, 0.25, spot)
@@ -176,13 +190,16 @@ def _build_snapshot(
             print(f"[Snapshot] VolSurface OK — {surf}")
             print(f"[Snapshot] σ_loc ATM: 3M={sig_3m:.2%}, 1Y={sig_1y:.2%}")
     except Exception as e:
-        if verbose:
-            print(f"[Snapshot] VolSurface indisponible ({e}) — surface plate 25%")
-        surf = VolSurface.flat(valuation_date, spot, r_1y, div.q, 0.25)
+        surf = load_cached_surface(ticker, spot, r_1y, div.q)
+        if surf is not None:
+            print(f"[Snapshot] ⚠ VolSurface live indisponible ({type(e).__name__}) — "
+                  f"dernier cache EOD utilisé.")
+        else:
+            print(f"[Snapshot] ⚠ VolSurface indisponible ({type(e).__name__}) et aucun cache "
+                  f"— surface PLATE 25 %.")
+            surf = VolSurface.flat(valuation_date, spot, r_1y, div.q, 0.25)
 
-    # Surface SSVI sans-arbitrage (Gatheral-Jacquier) : lisse la surface brute,
-    # rend Dupire et la calibration Heston stables. Repli silencieux sur la
-    # surface brute si la calibration SSVI échoue.
+    # Lissage SSVI sans arbitrage, surface brute conservée en cas d'échec
     if use_ssvi:
         try:
             from pricing_lib.market_data.ssvi import ssvi_from_grid
@@ -667,9 +684,9 @@ def Phoenix(
     mat_months = _parse_tenor_months(maturity)
     snap       = _build_snapshot(ticker, float(spot), start)
 
-    B_c = barrier_coupon  * spot if barrier_coupon  < 10 else barrier_coupon
-    B_r = barrier_recall  * spot if barrier_recall  < 10 else barrier_recall
-    B_k = capital_barrier * spot if capital_barrier < 10 else capital_barrier
+    B_c = barrier_level(barrier_coupon,  spot)
+    B_r = barrier_level(barrier_recall,  spot)
+    B_k = barrier_level(capital_barrier, spot)
 
     pricer = PhoenixPricer(
         snapshot=snap, n_paths=int(n_paths), start_date=start, S0=float(spot),
@@ -720,8 +737,8 @@ def Athena(
     mat_months = _parse_tenor_months(maturity)
     snap       = _build_snapshot(ticker, float(spot), start)
 
-    B_r = barrier_recall  * spot if barrier_recall  < 10 else barrier_recall
-    B_k = capital_barrier * spot if capital_barrier < 10 else capital_barrier
+    B_r = barrier_level(barrier_recall,  spot)
+    B_k = barrier_level(capital_barrier, spot)
 
     pricer = AthenaPricer(
         snapshot=snap, n_paths=int(n_paths), start_date=start, S0=float(spot),
@@ -751,42 +768,102 @@ def build_snapshot(ticker: str, spot: float, start_date: str) -> MarketSnapshot:
 
 def _make_pricer_fn(mode: str, product: str, snap: MarketSnapshot,
                     T: float, start, n_paths, seed, **pkwargs):
-    """Retourne une closure f(market)->float pour n'importe quel produit."""
+    """
+    Retourne une closure f(market)->float pour n'importe quel produit.
+    Coupon et participation sont calculés une fois sur le marché de base puis
+    gardés constants dans les scénarios.
+    """
     product_l = product.lower().replace("-", "_").replace(" ", "_")
     ratio     = pkwargs.get("ratio", 1.0)
     rc_cap    = pkwargs.get("cap", snap.spot)
+    S0        = snap.spot
+
+    def _pricer(market):
+        if mode == "AL":
+            return AnalyticalPricer(market)
+        return MCPricer(market, int(n_paths), seed=seed)
+
+
+    terms: dict = {}
+    if product_l in ("rc", "reverse_convertible"):
+        if mode == "MC":
+            terms["coupon"] = float(pkwargs["coupon"])
+        else:
+            terms["coupon"] = AnalyticalPricer(snap).reverse_convertible(
+                cap=rc_cap, T=T, freq=pkwargs.get("freq", "A"),
+                nominal=pkwargs.get("nominal", 100.0), start=start).fair_coupon
+    elif product_l in ("phoenix", "athena"):
+        if "coupon" in pkwargs:
+            terms["coupon"] = float(pkwargs["coupon"])
+        else:
+            terms["coupon"] = _autocall_pricer(product_l, snap, n_paths or 20_000, seed,
+                                               start, S0, "AL", 0.0, pkwargs).price().fair_coupon
+
+    def _part(res_fn):
+        if "part" not in terms:
+            terms["part"] = pkwargs.get("part", res_fn(_pricer(snap)).fair_participation)
+        return terms["part"]
 
     def _fn(market: MarketSnapshot) -> float:
-        if mode == "AL":
-            p = AnalyticalPricer(market)
-        else:
-            p = MCPricer(market, int(n_paths), seed=seed)
+        p = _pricer(market)
         if product_l in ("call", "c"):
             return p.call(pkwargs["K"], T, ratio).price
         elif product_l in ("put", "p"):
             return p.put(pkwargs["K"], T, ratio).price
         elif product_l in ("rc", "reverse_convertible"):
-            return p.reverse_convertible(cap=rc_cap, T=T,
-                freq=pkwargs.get("freq", "A"), nominal=pkwargs.get("nominal", 100.0),
-                ratio=ratio, start=start).price
+            kw = dict(cap=rc_cap, T=T, freq=pkwargs.get("freq", "A"),
+                      nominal=pkwargs.get("nominal", 100.0), ratio=ratio, start=start,
+                      coupon=terms["coupon"])
+            return p.reverse_convertible(**kw).price
         elif product_l in ("bonus", "bonus_certificate"):
             return p.bonus_certificate(pkwargs["X"], pkwargs["B"], T, ratio).price
         elif product_l in ("reverse_bonus", "reverse_bonus_certificate"):
             return p.reverse_bonus_certificate(pkwargs["X"], pkwargs["B"], T, ratio).price
-        elif product_l in ("twin_win", "twin_win_certificate"):
-            return p.twin_win_certificate(pkwargs["X"], pkwargs["B"], T, ratio).price
-        elif product_l in ("airbag", "airbag_certificate"):
-            return p.airbag_certificate(pkwargs["X"], pkwargs["B"], T, ratio).price
         elif product_l in ("discount", "discount_certificate"):
             return p.discount_certificate(pkwargs["X"], T, ratio).price
+        elif product_l in ("twin_win", "twin_win_certificate"):
+            f = lambda pr, **k: pr.twin_win_certificate(pkwargs["X"], pkwargs["B"], T, ratio, **k)
+            return f(p, part=_part(f)).price
+        elif product_l in ("airbag", "airbag_certificate"):
+            f = lambda pr, **k: pr.airbag_certificate(pkwargs["X"], pkwargs["B"], T, ratio, **k)
+            return f(p, part=_part(f)).price
         elif product_l in ("sprint", "sprint_certificate"):
-            return p.sprint_certificate(pkwargs["X"], pkwargs["cap_level"], T, ratio).price
+            f = lambda pr, **k: pr.sprint_certificate(pkwargs["X"], pkwargs["cap_level"], T, ratio, **k)
+            return f(p, part=_part(f)).price
         elif product_l in ("outperformance", "outperformance_certificate"):
-            return p.outperformance_certificate(pkwargs["X"], T, ratio).price
+            f = lambda pr, **k: pr.outperformance_certificate(pkwargs["X"], T, ratio, **k)
+            return f(p, part=_part(f)).price
+        elif product_l in ("garantie", "garantie_certificate"):
+            f = lambda pr, **k: pr.garantie_certificate(pkwargs["X"], T,
+                                                         pkwargs.get("nominal", 100.0), ratio, **k)
+            return f(p, part=_part(f)).price
+        elif product_l in ("phoenix", "athena"):
+
+            return _autocall_pricer(product_l, market, n_paths or 20_000, seed, start, S0,
+                                    "MC", terms["coupon"], pkwargs,
+                                    spot=market.spot).price().price
         else:
-            raise ValueError(f"product='{product}' non supporte. "
-                "Options: call, put, rc, bonus, reverse_bonus, twin_win, airbag, discount.")
+            raise ValueError(f"product='{product}' non supporte. Options: call, put, rc, "
+                             "bonus, reverse_bonus, discount, twin_win, airbag, sprint, "
+                             "outperformance, garantie, phoenix, athena.")
     return _fn
+
+
+def _autocall_pricer(kind, snap, n_paths, seed, start, S0, mode, coupon, kw, spot=None):
+    """Construit un PhoenixPricer / AthenaPricer à partir des kwargs de l'API risque."""
+    mat = _parse_tenor_months(kw.get("maturity", "60M" if kind == "phoenix" else "36M"))
+    B_r = barrier_level(kw.get("barrier_recall", 1.00), S0)
+    B_k = barrier_level(kw.get("capital_barrier", 0.70), S0)
+    common = dict(snapshot=snap, n_paths=int(n_paths), start_date=start, S0=float(S0),
+                  freq_months=int(kw.get("freq_months", 3)), maturity_months=mat,
+                  kg=kw.get("kg", "no"), mode=mode, coupon=float(coupon), seed=seed,
+                  spot=spot)
+    if kind == "phoenix":
+        return PhoenixPricer(barrier_coupon=barrier_level(kw.get("barrier_coupon", 0.80), S0),
+                             barrier_recall=B_r, capital_barrier=B_k,
+                             autocall_start=int(kw.get("autocall_start", 0)), **common)
+    return AthenaPricer(barrier_recall=B_r, capital_barrier=B_k, **common)
+
 
 def Stress(mode: str, ticker: str, *args,
            product: str = "call", seed: Optional[int] = None,
@@ -803,6 +880,7 @@ def Stress(mode: str, ticker: str, *args,
     start  = _parse_date(start_str)
     snap   = _build_snapshot(ticker, float(spot_val), start)
     T      = _parse_tenor(tenor_str)
+    pkwargs.setdefault("maturity", tenor_str)
     fn     = _make_pricer_fn(mode, product, snap, T, start, n_paths, seed, **pkwargs)
     return StressTest(_ClosurePricer(fn), None, snap, scenarios=scenarios).run()
 
@@ -823,6 +901,7 @@ def ScenarioGrid(mode: str, ticker: str, *args,
     T      = _parse_tenor(tenor_str)
     _ss = spot_shocks if spot_shocks is not None else [-0.20,-0.10,0,+0.10,+0.20]
     _vs = vol_shocks  if vol_shocks  is not None else [-0.05, 0, +0.05]
+    pkwargs.setdefault("maturity", tenor_str)
     fn  = _make_pricer_fn(mode, product, snap, T, start, n_paths, seed, **pkwargs)
     return ScenarioAnalyzer(_ClosurePricer(fn), None, snap).spot_vol_grid(_ss, _vs)
 
@@ -834,14 +913,15 @@ if __name__ == "__main__":
             barrier_coupon=0.70,
             barrier_recall=1.00,
             capital_barrier=0.50,
-            freq_months=3, maturity='12M', kg='no',compute_greeks=True)
+            freq_months=3, maturity='12M', kg='no',
+            compute_greeks=True)
 
     phx_mc = Phoenix('MC', 'GLE', 100000, '29/05/2026', 71,
-               coupon=0.0455,
+               coupon=0.01114,
                barrier_coupon=0.70,
                barrier_recall=1.00,
                capital_barrier=0.50,
-               freq_months=3, maturity='60M', kg='no',
+               freq_months=3, maturity='12M', kg='no',
                compute_greeks=True)
     
- 
+    print(phx_mc) 

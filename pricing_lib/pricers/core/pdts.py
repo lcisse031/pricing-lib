@@ -70,6 +70,14 @@ def _barrier(flag: str, S: float, X: float, H: float, K: float,
         elif bt == "ui": return intrinsic if S >= H else 0.
         return intrinsic
 
+    # Barrier already crossed: knocked out (rebate) or knocked in (vanilla).
+    down = flag[1] == "d"
+    crossed = (S <= H) if down else (S >= H)
+    if crossed:
+        if flag[2] == "o":
+            return K
+        return _gbs(flag[0], S, X, T, r, b, sigma)
+
     sigma = max(sigma, 1e-6)   # évite mu → ±∞ et HS**(2*(mu+1)) → overflow
     sqT = sigma * np.sqrt(T)
     mu  = (b - .5 * sigma**2) / sigma**2
@@ -90,10 +98,7 @@ def _barrier(flag: str, S: float, X: float, H: float, K: float,
               - X * np.exp(-r*T)    * N(eta*(x1-sqT)))
     B  = eta * (S * np.exp((b-r)*T) * N(eta*x2)
               - X * np.exp(-r*T)    * N(eta*(x2-sqT)))
-    # Haug Table 4-1 : les termes "réfléchis" C,D et le rebate E utilisent η
-    # (down/up = `phi` ici), PAS φ (call/put = `eta`). Bug corrigé : l'argument
-    # des N de C,D était `phi*eta` (un η de trop) et E utilisait `eta` au lieu de
-    # `phi` → puts down/up-barrier mal pricés (les calls, η_code·1, étaient OK).
+    # Haug: C, D and E use the down/up sign (phi here), not the call/put sign.
     C  = eta * (S * np.exp((b-r)*T) * HS**(2*(mu+1)) * N(phi*y1)
               - X * np.exp(-r*T)    * HS**(2*mu)       * N(phi*(y1-sqT)))
     D  = eta * (S * np.exp((b-r)*T) * HS**(2*(mu+1)) * N(phi*y2)
@@ -134,6 +139,8 @@ def _cndo(S: float, H: float, K: float,
     """
     if T <= 0:
         return K if S > H else 0.
+    if S <= H:
+        return 0.
     sqT = sigma * np.sqrt(T)
     mu  = (b - .5 * sigma**2) / sigma**2
     x2  = np.log(S / H) / sqT + (1. + mu) * sqT
@@ -310,7 +317,7 @@ def leveraged_bonus_certificate(S, X, B, B2, T, r, r_d, sigma,
 
 def _rc(S, cap, T, r, r_d, sigma, nominal, coupon) -> float:
     """Reverse Convertible — price as % of nominal."""
-    bond  = nominal * (1. + coupon * T) / (1. + r) ** T
+    bond  = nominal * (1. + coupon * T) * np.exp(-r * T)
     sp    = _gbs("p", S, cap, T, r, r - r_d, sigma)
     return (bond - sp * (nominal / cap)) / nominal * 100.
 
@@ -320,7 +327,7 @@ def _rc_plus_pro(S, cap, B, T, r, r_d, sigma, nominal, coupon,
     """Reverse Convertible Plus Pro — price as % of nominal."""
     b     = r - r_d
     ratio = nominal / cap
-    bond  = nominal * (1. + coupon * T) / (1. + r) ** T
+    bond  = nominal * (1. + coupon * T) * np.exp(-r * T)
     sp    = _gbs("p", S, cap, T, r, b, sigma)
     dop   = 0. if barrier_hit else _barrier("pdo", S, cap, B, 0., T, r, b, sigma)
     return (bond - sp * ratio + dop * ratio) / nominal * 100.
@@ -432,11 +439,12 @@ def _outperformance(S, X, T, r, r_d, sigma, part) -> float:
 
 
 def _capped_outperformance(S, X, cap, T, r, r_d, sigma, part) -> float:
+    """ZSC + (part-1)·Call(X) − part·Call(cap)."""
     b   = r - r_d
     zsc = _gbs("c", S, 1e-12, T, r, b, sigma)
     c   = _gbs("c", S, X,   T, r, b, sigma) * (part - 1.)
-    sc  = _gbs("c", S, cap, T, r, b, sigma) * (part - 1.)
-    return zsc + c - 2. * sc
+    sc  = _gbs("c", S, cap, T, r, b, sigma) * part
+    return zsc + c - sc
 
 
 def _outperformance_plus(S, X, B, T, r, r_d, sigma, part, barrier_hit=False) -> float:
@@ -448,11 +456,12 @@ def _outperformance_plus(S, X, B, T, r, r_d, sigma, part, barrier_hit=False) -> 
 
 
 def _sprint(S, X, cap, T, r, r_d, sigma, part) -> float:
+    """ZSC + (part-1)·Call(X) − part·Call(cap)."""
     b   = r - r_d
     zsc = _gbs("c", S, 1e-12, T, r, b, sigma)
     lc  = _gbs("c", S, X,   T, r, b, sigma) * (part - 1.)
-    sc  = _gbs("c", S, cap, T, r, b, sigma) * (part - 1.)
-    return zsc + lc - 2. * sc
+    sc  = _gbs("c", S, cap, T, r, b, sigma) * part
+    return zsc + lc - sc
 
 
 def _twin_win(S, X, B, T, r, r_d, sigma, part) -> float:
@@ -471,9 +480,10 @@ def _reverse_outperformance(S, S0, X, T, r, r_d, sigma, part) -> float:
 
 
 def _garantie(S, X, T, r, r_d, sigma, part, nominal=100.) -> float:
+    """Payoff: nominal · [1 + part · (S_T/X − 1)⁺]."""
     b    = r - r_d
     bond = nominal * np.exp(-r * T)
-    c    = _gbs("c", S, X, T, r, b, sigma) * part
+    c    = _gbs("c", S, X, T, r, b, sigma) * (nominal / X) * part
     return bond + c
 
 

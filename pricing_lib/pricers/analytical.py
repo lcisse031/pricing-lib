@@ -81,6 +81,15 @@ def _coupon_dates(start: date, T_years: float, freq: str) -> List[date]:
     return dates
 
 
+def _schedule(start: date, T_years: float, freq: str, valuation: date) -> List[date]:
+    """
+    Dates de coupon depuis `start` jusqu'à valuation + T_years
+    (T_years = maturité résiduelle).
+    """
+    elapsed = max((valuation - start).days, 0) / 365.25
+    return _coupon_dates(start, elapsed + T_years, freq)
+
+
 def _bond_value(
     nominal: float,
     coupon: float,
@@ -88,20 +97,27 @@ def _bond_value(
     T_years: float,
     start: date,
     snapshot: MarketSnapshot,
+    rate_shift: float = 0.0,
 ) -> float:
-    """Valeur actualisée de l'obligation (coupons périodiques + remboursement)."""
+    """
+    Valeur actualisée de l'obligation (coupons futurs + remboursement).
+    rate_shift : décalage parallèle du taux, utilisé pour le rho.
+    """
     n_per_year = _freq_map(freq)
     coupon_period = coupon / n_per_year
-    pay_dates = _coupon_dates(start, T_years, freq)
+    pay_dates = _schedule(start, T_years, freq, snapshot.valuation_date)
+
+    def _df(tau: float) -> float:
+        return snapshot.ois_curve.df_tau(tau) * math.exp(-rate_shift * tau)
 
     pv = 0.0
     for d in pay_dates:
         tau = (d - snapshot.valuation_date).days / 365.25
         if tau > 0:
-            pv += nominal * coupon_period * snapshot.ois_curve.df_tau(tau)
+            pv += nominal * coupon_period * _df(tau)
 
     # Remboursement du nominal à maturité
-    pv += nominal * snapshot.ois_curve.df_tau(T_years)
+    pv += nominal * _df(T_years)
     return pv
 
 
@@ -116,7 +132,7 @@ def _cashflow_df(
     """DataFrame des flux pour RC avec fréquence."""
     n_per_year = _freq_map(freq)
     coupon_period = coupon / n_per_year
-    pay_dates = _coupon_dates(start, T_years, freq)
+    pay_dates = _schedule(start, T_years, freq, snapshot.valuation_date)
 
     rows = []
     for d in pay_dates:
@@ -133,9 +149,8 @@ def _cashflow_df(
     # Ajout du nominal final
     tau_T = T_years
     df_T  = snapshot.ois_curve.df_tau(tau_T)
-    rows[-1]["PV_coupon"] = round(
-        rows[-1]["PV_coupon"] + nominal * df_T, 4
-    )
+    if rows:
+        rows[-1]["PV_coupon"] = round(rows[-1]["PV_coupon"] + nominal * df_T, 4)
     return pd.DataFrame(rows)
 
 
@@ -144,9 +159,10 @@ def _rc_price_with_freq(
     r: float, q: float, sigma: float,
     nominal: float, coupon: float, freq: str,
     start: date, snapshot: MarketSnapshot,
+    rate_shift: float = 0.0,
 ) -> float:
     """RC avec fréquence : bond actualisé - short put × ratio."""
-    bond  = _bond_value(nominal, coupon, freq, T, start, snapshot)
+    bond  = _bond_value(nominal, coupon, freq, T, start, snapshot, rate_shift)
     ratio = nominal / cap
     sp    = _gbs("p", S, cap, T, r, r - q, sigma)
     return (bond - sp * ratio) / nominal * 100.0
@@ -186,17 +202,13 @@ class AnalyticalPricer:
         return self.snap.q
 
     def _rT(self, T: float) -> float:
-        """Taux forward OIS continu jusqu'à T : r_T = −ln(df(T))/T.
-        Cohérence drift/actualisation : exp(−r_T·T) = df_OIS(T) exactement
-        (et bump de r_T → drift ET actualisation, rho complet)."""
+        """Taux zéro continu OIS : r_T = −ln(df(T))/T."""
         T = max(float(T), 1e-6)
         ois = self.snap.ois_curve
         return -math.log(max(ois.df_tau(T), 1e-12)) / T
 
     def _iv(self, T: float, K: float) -> float:
-        """Vol IMPLICITE de marché σ_IV(T, K) — interpolation directe de la surface.
-        À utiliser pour les vanilles (call, put, warrant).
-        BS(σ_IV) = prix de marché par définition."""
+        """Vol implicite σ_IV(T, K), pour les vanilles."""
         return self.snap.vol_surface.vol(T, K)
 
     def _atm_iv(self, T: float) -> float:
@@ -216,12 +228,8 @@ class AnalyticalPricer:
     def _eff_sigma(self, T: float, K_lo: float, K_hi: float,
                    n_t: int = 4, n_k: int = 5) -> float:
         """
-        Vol locale EFFECTIVE pour les exotiques/barrières : RMS de σ_loc(t, K)
-        sur la bande de strikes [K_lo, K_hi] et le temps [0, T].
-
-        Bien plus représentative qu'un point unique — un produit à barrière
-        dépend de la vol sur toute la plage de niveaux qu'il peut toucher, pas
-        seulement au strike. Sur surface plate, redonne la vol constante.
+        Vol effective des exotiques : moyenne quadratique de σ_loc(t, K) sur
+        [K_lo, K_hi] × [0, T].
         """
         K_lo, K_hi = sorted((max(K_lo, 1e-6), max(K_hi, 1e-6)))
         ts = np.linspace(T / n_t, T, max(n_t, 1))
@@ -342,11 +350,12 @@ class AnalyticalPricer:
                             product=f"Turbo {'Call' if flag=='c' else 'Put'}")
 
     def airbag_certificate(self, X: float, B: float, T: float,
-                            ratio: float = 1.0) -> PricingResult:
+                            ratio: float = 1.0, part: Optional[float] = None) -> PricingResult:
         sigma = self._eff_sigma(T, B, X)
         S, r, q = self.S, self._rT(T), self.q
-        part   = implied_participation_airbag(S, S, X, B, T, r, q, sigma)
-        pfn    = lambda S, r, q, sigma, T: _airbag(S, X, B, T, r, q, sigma, part)
+        if part is None:
+            part = implied_participation_airbag(S, S, X, B, T, r, q, sigma)
+        pfn    = lambda S, r, q, sigma, T: _airbag(S, X, B, T, r, q, sigma, part) * ratio
         price  = pfn(S, r, q, sigma, T)
         greeks = compute_greeks_fd_vol(pfn, price, S, r, q, sigma, T)
         res    = self._result(price, greeks, S, r, q, sigma, T, product="Airbag Certificate")
@@ -354,12 +363,14 @@ class AnalyticalPricer:
         return res
 
     def garantie_certificate(self, X: float, T: float,
-                              nominal: float = 100.0, ratio: float = 1.0) -> PricingResult:
+                              nominal: float = 100.0, ratio: float = 1.0,
+                              part: Optional[float] = None) -> PricingResult:
         sigma = self._eff_sigma(T, self.S, X)
         S, r, q = self.S, self._rT(T), self.q
-        # Cible = nominal (capital garanti, prix au pair = nominal), PAS le spot.
-        part   = implied_participation_garantie(nominal, S, X, T, r, q, sigma, nominal)
-        pfn    = lambda S, r, q, sigma, T: _garantie(S, X, T, r, q, sigma, part, nominal)
+
+        if part is None:
+            part = implied_participation_garantie(nominal, S, X, T, r, q, sigma, nominal)
+        pfn    = lambda S, r, q, sigma, T: _garantie(S, X, T, r, q, sigma, part, nominal) * ratio
         price  = pfn(S, r, q, sigma, T)
         greeks = compute_greeks_fd_vol(pfn, price, S, r, q, sigma, T)
         res    = self._result(price, greeks, S, r, q, sigma, T, product="Garantie Certificate")
@@ -376,25 +387,31 @@ class AnalyticalPricer:
         nominal: float = 100.0,
         ratio: float = 1.0,
         start: Optional[date] = None,
+        coupon: Optional[float] = None,
     ) -> PricingResult:
-        """RC avec fréquence de coupon. Retourne le coupon fair annualisé."""
+        """
+        RC avec fréquence de coupon. Sans coupon, calcule le coupon fair
+        (prix = 100 %).
+        """
         if start is None:
             start = self.snap.valuation_date
         sigma = self._eff_sigma(T, cap, self.S)
         S, r, q = self.S, self._rT(T), self.q
         snap = self.snap
+        r0 = r
 
-        # Coupon fair : prix = 100% du nominal
-        from scipy.optimize import brentq
-        def price_at_coupon(c):
-            return _rc_price_with_freq(S, cap, T, r, q, sigma, nominal, c, freq, start, snap) - 100.0
+        if coupon is None:
+            from scipy.optimize import brentq
+            def price_at_coupon(c):
+                return _rc_price_with_freq(S, cap, T, r, q, sigma, nominal, c, freq, start, snap) - 100.0
+            coupon = brentq(price_at_coupon, 0.0, 2.0, xtol=1e-8)
 
-        coupon = brentq(price_at_coupon, 0.0, 2.0, xtol=1e-8)
-        price  = _rc_price_with_freq(S, cap, T, r, q, sigma, nominal, coupon, freq, start, snap)
 
-        # Greeks sur le prix
         def pfn(S, r, q, sigma, T):
-            return _rc_price_with_freq(S, cap, T, r, q, sigma, nominal, coupon, freq, start, snap)
+            return _rc_price_with_freq(S, cap, T, r, q, sigma, nominal, coupon,
+                                       freq, start, snap, rate_shift=r - r0)
+
+        price  = pfn(S, r, q, sigma, T)
 
         greeks = compute_greeks_fd_vol(pfn, price, S, r, q, sigma, T)
         cf_df  = _cashflow_df(nominal, coupon, freq, T, start, snap)
@@ -418,6 +435,7 @@ class AnalyticalPricer:
         nominal: float = 100.0,
         barrier_hit: bool = False,
         start: Optional[date] = None,
+        coupon: Optional[float] = None,
     ) -> PricingResult:
         """RC Plus Pro (knock-in put) avec fréquence de coupon."""
         if start is None:
@@ -425,6 +443,7 @@ class AnalyticalPricer:
         sigma = self._eff_sigma(T, B, cap)
         S, r, q = self.S, self._rT(T), self.q
         snap = self.snap
+        r0 = r
 
         from scipy.optimize import brentq
 
@@ -437,11 +456,12 @@ class AnalyticalPricer:
             dop = 0.0 if barrier_hit else _barrier("pdo", S, cap, B, 0.0, T, r, b, sigma)
             return (bond - sp * ratio + dop * ratio) / nominal * 100.0 - 100.0
 
-        coupon = brentq(price_at_coupon, 0.0, 2.0, xtol=1e-8)
+        if coupon is None:
+            coupon = brentq(price_at_coupon, 0.0, 2.0, xtol=1e-8)
 
         def pfn(S, r, q, sigma, T):
             from pricing_lib.pricers.core.pdts import _gbs, _barrier
-            bond  = _bond_value(nominal, coupon, freq, T, start, snap)
+            bond  = _bond_value(nominal, coupon, freq, T, start, snap, rate_shift=r - r0)
             ratio = nominal / cap
             b = r - q
             sp  = _gbs("p", S, cap, T, r, b, sigma)
@@ -464,35 +484,40 @@ class AnalyticalPricer:
 
     # ── Catégorie 3 : participation produits ──────────────────────────────────
 
-    def outperformance_certificate(self, X: float, T: float, ratio: float = 1.0) -> PricingResult:
+    def outperformance_certificate(self, X: float, T: float, ratio: float = 1.0,
+                                   part: Optional[float] = None) -> PricingResult:
         sigma = self._eff_sigma(T, self.S, X)
         S, r, q = self.S, self._rT(T), self.q
-        part   = implied_participation_outperformance(S, S, X, T, r, q, sigma)
-        pfn    = lambda S, r, q, sigma, T: _outperformance(S, X, T, r, q, sigma, part)
+        if part is None:
+            part = implied_participation_outperformance(S, S, X, T, r, q, sigma)
+        pfn    = lambda S, r, q, sigma, T: _outperformance(S, X, T, r, q, sigma, part) * ratio
         price  = pfn(S, r, q, sigma, T)
         greeks = compute_greeks_fd_vol(pfn, price, S, r, q, sigma, T)
         res    = self._result(price, greeks, S, r, q, sigma, T, product="Outperformance Certificate")
         res.fair_participation = round(part, 6)
         return res
 
-    def sprint_certificate(self, X: float, cap: float, T: float, ratio: float = 1.0) -> PricingResult:
+    def sprint_certificate(self, X: float, cap: float, T: float, ratio: float = 1.0,
+                           part: Optional[float] = None) -> PricingResult:
         sigma = self._eff_sigma(T, X, cap)
         S, r, q = self.S, self._rT(T), self.q
-        part   = implied_participation_sprint(S, S, X, cap, T, r, q, sigma)
-        pfn    = lambda S, r, q, sigma, T: _sprint(S, X, cap, T, r, q, sigma, part)
+        if part is None:
+            part = implied_participation_sprint(S, S, X, cap, T, r, q, sigma)
+        pfn    = lambda S, r, q, sigma, T: _sprint(S, X, cap, T, r, q, sigma, part) * ratio
         price  = pfn(S, r, q, sigma, T)
         greeks = compute_greeks_fd_vol(pfn, price, S, r, q, sigma, T)
         res    = self._result(price, greeks, S, r, q, sigma, T, product="Sprint Certificate")
         res.fair_participation = round(part, 6)
         return res
 
-    def twin_win_certificate(self, X: float, B: float, T: float, ratio: float = 1.0) -> PricingResult:
+    def twin_win_certificate(self, X: float, B: float, T: float, ratio: float = 1.0,
+                             part: Optional[float] = None) -> PricingResult:
         sigma = self._eff_sigma(T, B, X)
         S, r, q = self.S, self._rT(T), self.q
-        # Bracket élargi (y compris négatif) : sur fort dividende la participation
-        # fair peut sortir de [0, 5], il faut laisser le solveur respirer.
-        part   = implied_participation_twin_win(S, S, X, B, T, r, q, sigma, bracket=(-2., 20.))
-        pfn    = lambda S, r, q, sigma, T: _twin_win(S, X, B, T, r, q, sigma, part)
+        # Bracket large : avec un fort dividende la participation peut sortir de [0, 5]
+        if part is None:
+            part = implied_participation_twin_win(S, S, X, B, T, r, q, sigma, bracket=(-2., 20.))
+        pfn    = lambda S, r, q, sigma, T: _twin_win(S, X, B, T, r, q, sigma, part) * ratio
         price  = pfn(S, r, q, sigma, T)
         greeks = compute_greeks_fd_vol(pfn, price, S, r, q, sigma, T)
         res    = self._result(price, greeks, S, r, q, sigma, T, product="Twin Win Certificate")

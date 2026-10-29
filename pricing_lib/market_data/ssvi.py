@@ -51,6 +51,10 @@ from scipy.optimize import minimize
 
 # ─── Noyau SSVI ───────────────────────────────────────────────────────────────
 
+# Borne butterfly de Gatheral-Jacquier (4) avec une petite marge
+_BF_TARGET = 3.92
+
+
 def _phi(theta: float, eta: float, gamma: float) -> float:
     """φ(θ) = η·θ^(−γ)  (power-law)."""
     return eta / (max(theta, 1e-8) ** gamma)
@@ -156,11 +160,14 @@ def calibrate_ssvi(
     K_pts, W_pts, TH_pts, WT_pts = [], [], [], []
     for i, T in enumerate(tenors):
         F = spot * math.exp((r - q) * T)
+        sd = math.sqrt(max(theta[i], 1e-8))        # σ_ATM √T
         for j, K in enumerate(strikes):
             sig = vols[i, j]
             if not np.isfinite(sig) or sig <= 0:
                 continue
             k = math.log(K / F)
+            if abs(k) > 3.0 * sd:      # ailes cotées au tick, pas d'information
+                continue
             K_pts.append(k)
             W_pts.append(sig * sig * T)
             TH_pts.append(theta[i])
@@ -185,9 +192,9 @@ def calibrate_ssvi(
         for th in theta:
             ph = eta / (max(th, 1e-8) ** gamma)
             tp = th * ph
-            pen += max(0.0, tp * (1 + abs(rho)) - 4.0) ** 2
-            pen += max(0.0, tp * ph * (1 + abs(rho)) - 4.0) ** 2
-        return float(np.sum(resid)) + 100.0 * pen
+            pen += max(0.0, tp * (1 + abs(rho)) - _BF_TARGET) ** 2
+            pen += max(0.0, tp * ph * (1 + abs(rho)) - _BF_TARGET) ** 2
+        return float(np.sum(resid)) + 1.0e3 * pen
 
     bounds = [(-0.99, 0.99), (0.01, 10.0), (0.01, 0.50)]
     best, best_f = None, np.inf
@@ -206,10 +213,28 @@ def calibrate_ssvi(
     if best is None:
         return SSVIParams(rho=-0.5, eta=1.0, gamma=0.4), theta
 
+    rho_b, eta_b, gamma_b = float(best[0]), float(best[1]), float(best[2])
+
+    # Si les conditions butterfly sont violées (c1 = θφ(1+|ρ|), c2 = θφ²(1+|ρ|),
+    # c1 ∝ η et c2 ∝ η²), on réduit η juste assez pour repasser sous la borne.
+    c1 = max(th * (eta_b / max(th, 1e-8) ** gamma_b) * (1 + abs(rho_b))
+             for th in theta)
+    c2 = max(th * (eta_b / max(th, 1e-8) ** gamma_b) ** 2 * (1 + abs(rho_b))
+             for th in theta)
+    if c1 > _BF_TARGET or c2 > _BF_TARGET:
+        s = min(_BF_TARGET / c1 if c1 > 0 else 1.0,
+                math.sqrt(_BF_TARGET / c2) if c2 > 0 else 1.0)
+        eta_b *= s
+        print(f"[SSVI] Projection butterfly — η réduit ×{s:.3f} → {eta_b:.3f} "
+              f"(surface garantie sans-arbitrage)")
+
+    params_out = SSVIParams(rho=rho_b, eta=eta_b, gamma=gamma_b)
     rmse = math.sqrt(best_f / max(len(K_pts), 1))
-    print(f"[SSVI] Calibration — {SSVIParams(*best)}  (résidu w≈{rmse:.2e})")
-    return SSVIParams(rho=float(best[0]), eta=float(best[1]),
-                      gamma=float(best[2])), theta
+    print(f"[SSVI] Calibration — {params_out}  (résidu w≈{rmse:.2e}, {len(K_pts)} points)")
+    if rmse > 5e-3:
+        print(f"[SSVI] ⚠ Résidu élevé — surface de marché bruitée ou incohérente, "
+              f"vérifier les cotations.")
+    return params_out, theta
 
 
 # ─── Surface SSVI ─────────────────────────────────────────────────────────────
@@ -333,13 +358,35 @@ class SSVISurface:
 
 # ─── Constructeur depuis une VolSurface brute ────────────────────────────────
 
+def _observed_mask(vols: np.ndarray, tol: float = 1e-9) -> np.ndarray:
+    """
+    Masque des cellules observées. Les cellules issues d'un prolongement plat
+    sont identiques à leur voisine (maturité précédente ou strike adjacent).
+    """
+    v = np.asarray(vols, float)
+    mask = np.isfinite(v) & (v > 0)
+    if v.shape[0] > 1:
+        mask[1:] &= ~(np.abs(v[1:] - v[:-1]) < tol)
+    if v.shape[1] > 1:
+        same_left  = np.zeros_like(mask); same_left[:, 1:]   = np.abs(v[:, 1:] - v[:, :-1]) < tol
+        same_right = np.zeros_like(mask); same_right[:, :-1] = np.abs(v[:, :-1] - v[:, 1:]) < tol
+        mask &= ~(same_left | same_right)
+
+    if mask.sum() < 5:
+        mask = np.isfinite(v) & (v > 0)
+    return mask
+
+
 def ssvi_from_grid(surf) -> SSVISurface:
     """
     Calibre une SSVISurface sans-arbitrage à partir d'une VolSurface brute
     (mêmes tenors/strikes/spot/r/q).
     """
+    vols = np.asarray(surf.vols, float)
+    mask = _observed_mask(vols)
     params, theta = calibrate_ssvi(
-        surf.tenors, surf.strikes, surf.vols, surf.spot, surf.r, surf.q
+        surf.tenors, surf.strikes, np.where(mask, vols, np.nan),
+        surf.spot, surf.r, surf.q,
     )
     return SSVISurface(
         valuation_date=surf.valuation_date, spot=surf.spot, r=surf.r, q=surf.q,

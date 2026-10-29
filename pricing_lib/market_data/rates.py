@@ -68,15 +68,31 @@ def _bootstrap(rates: Dict[str, float]) -> Dict[float, float]:
     for T, _, r in items:
         if T < 1.0:
             dfs[T] = 1.0 / (1.0 + r * T)
-        else:
-            times_arr = np.array(sorted(dfs.keys()))
-            logdf_arr = np.array([math.log(dfs[t]) for t in times_arr])
-            payment_times = np.arange(1.0, T, 1.0)
-            known_sum = sum(
-                math.exp(float(np.interp(t, times_arr, logdf_arr)))
-                for t in payment_times
+            continue
+
+        times_arr = np.array(sorted(dfs.keys()))
+        logdf_arr = np.array([math.log(dfs[t]) for t in times_arr])
+        t_last, ldf_last = float(times_arr[-1]), float(logdf_arr[-1])
+        payment_times = np.arange(1.0, T, 1.0)
+
+        # Les coupons au-delà du dernier pilier dépendent du DF_T cherché
+        # (interpolation log-linéaire), d'où la résolution numérique.
+        known  = [t for t in payment_times if t <= t_last]
+        gap    = [t for t in payment_times if t > t_last]
+        known_sum = sum(math.exp(float(np.interp(t, times_arr, logdf_arr))) for t in known)
+
+        def swap_residual(ldf_T: float) -> float:
+            gap_sum = sum(
+                math.exp(ldf_last + (ldf_T - ldf_last) * (t - t_last) / (T - t_last))
+                for t in gap
             )
+            return r * (known_sum + gap_sum) + (1.0 + r) * math.exp(ldf_T) - 1.0
+
+        if not gap:
             dfs[T] = (1.0 - r * known_sum) / (1.0 + r)
+        else:
+            from scipy.optimize import brentq
+            dfs[T] = math.exp(brentq(swap_residual, -5.0, 1.0, xtol=1e-14))
 
     return dfs
 

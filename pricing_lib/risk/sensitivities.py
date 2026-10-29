@@ -180,7 +180,7 @@ class StressTest:
                 "Scenario":  sc.name,
                 "Spot choc": f"{sc.spot_pct:+.0%}",
                 "Vol choc":  f"{sc.vol_abs:+.0%}",
-                "Rate choc": f"{sc.rate_abs*100:+.0f}bp",
+                "Rate choc": f"{sc.rate_abs*1e4:+.0f}bp",
                 "Price":     round(price, 4),
                 "PnL":       round(pnl, 4),
                 "PnL %":     f"{pnl/abs(base_price)*100:+.2f}%" if base_price != 0 else "N/A",

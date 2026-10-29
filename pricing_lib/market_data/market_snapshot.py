@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Optional
 
+import numpy as np
+
 from .rates import OISCurve
 from .dividends import DividendCurve
 from .vol_surface import VolSurface
@@ -91,10 +93,8 @@ class MultiAssetSnapshot:
     ois_curve       : OISCurve               — courbe commune de discount
     """
 
-    import numpy as np
-
     assets:         list
-    corr_matrix:    "np.ndarray"
+    corr_matrix:    np.ndarray
     valuation_date: date
     ois_curve:      OISCurve
 

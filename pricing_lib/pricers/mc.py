@@ -12,7 +12,7 @@ Autres produits (barrières, participation, RC) :
     Modèle Heston calibré sur la surface.
     Greeks : différences finies centrées via compute_greeks_fd_heston.
 
-Cache de calibration : {ticker: HestonParams} — 1 calibration par session par ticker.
+Les paramètres Heston sont calibrés une fois par (ticker, date) puis mis en cache.
 """
 
 
@@ -30,7 +30,7 @@ from pricing_lib.market_data.vol_surface import dupire_local_vol
 from pricing_lib.models.heston import (
     HestonParams, DEFAULT_HESTON,
     heston_simulate, heston_simulate_paths,
-    calibrate_heston,
+    calibrate_heston, shift_heston_vol,
 )
 from pricing_lib.pricers.base import PricingResult
 from pricing_lib.risk.greeks import (
@@ -53,9 +53,7 @@ def _gbm_simulate(
     """
     S_T = S * exp((r - q - σ²/2)*T + σ*√T*Z).
 
-    qmc=True : suite de Sobol scramblée + inverse-CDF (quasi-Monte-Carlo).
-    Super-convergence : ~30× moins d'erreur qu'un tirage pseudo-aléatoire à
-    nombre de trajectoires égal (estimateur non biaisé grâce au scrambling).
+    qmc=True : Sobol scramblé + inverse de la loi normale.
     """
     if qmc:
         from scipy.stats import qmc as _qmc, norm as _norm
@@ -85,9 +83,16 @@ def get_heston_params(
     Retourne les paramètres Heston calibrés pour le ticker du snapshot.
     Utilise le cache si disponible, recalibre sinon.
 
-    Clé de cache = (ticker, date de valorisation) : on recalibre par date
-    (la surface change chaque jour) au lieu de geler les params au 1er appel.
+    Cache par (ticker, date). Pour un marché choqué, on repart des paramètres
+    du marché de base et on applique le choc de vol aux paramètres Heston.
     """
+    base = getattr(snapshot, "_base", None)
+    if base is not None:
+        shift = getattr(snapshot, "vol_shift", None)
+        if shift is None:
+            shift = getattr(snapshot, "_vbump", None) or 0.0
+        return shift_heston_vol(get_heston_params(base, force_recalibrate), float(shift))
+
     key = (snapshot.ticker, snapshot.valuation_date)
     if key in _HESTON_CACHE and not force_recalibrate:
         return _HESTON_CACHE[key]
@@ -130,12 +135,9 @@ class MCPricer:
         self.snap      = snapshot
         self.n_paths   = n_paths
         self.antithetic = antithetic
-        self.qmc       = qmc   # Sobol/QMC pour les vanilles GBM (super-convergence)
+        self.qmc       = qmc
         self.seed      = seed
-        # Calibration Heston PARESSEUSE : déclenchée seulement au 1er accès à
-        # `self.params`, c.-à-d. uniquement pour les produits exotiques.
-        # Les vanilles (GBM, σ_IV) ne touchent jamais params → pas de calibration.
-        self._params   = params
+        self._params   = params   # calibré à la demande (exotiques uniquement)
 
     @property
     def params(self) -> HestonParams:
@@ -158,11 +160,8 @@ class MCPricer:
 
     def _rT(self, T: float) -> float:
         """
-        Taux forward OIS continu jusqu'à T : r_T = −ln(df(T))/T.
-
-        Garantit la cohérence drift/actualisation : avec ce taux,
-        df = exp(−r_T·T) = df_OIS(T) exactement. Un bump de r_T décale donc
-        drift ET actualisation (rho « complet », pas seulement le drift).
+        Taux zéro continu OIS : r_T = −ln(df(T))/T, utilisé pour le drift
+        et l'actualisation.
         """
         T = max(float(T), 1e-6)
         ois = self.snap.ois_curve
@@ -203,20 +202,6 @@ class MCPricer:
             antithetic=self.antithetic,
             seed=self.seed,
         )
-
-    def _price_fn_terminal(self, payoff_fn, T: float):
-        """Retourne une fonction price_fn(S, r, q, T, params) pour les Greeks MC."""
-        def fn(S, r, q, T, params=None):
-            ST = heston_simulate(
-                S=S, r=r, q=q, T=T,
-                params=params or self.params,
-                n_paths=self.n_paths,
-                antithetic=self.antithetic,
-                seed=self.seed,
-            )
-            df = math.exp(-r * T)
-            return float(np.mean(payoff_fn(ST)) * df)
-        return fn
 
     def _greeks(self, price0: float, price_fn_mc, S, r, q, T) -> dict:
         return compute_greeks_fd_heston(
@@ -354,8 +339,6 @@ class MCPricer:
                                       control_mean=S * math.exp(-q * T))
 
         def pfn(S_arg, r, q, T, params=None):
-            # Barrière CONSERVÉE dans le bump (plus d'approximation sans-barrière) :
-            # on simule les chemins et on applique le monitoring continu.
             _ns  = max(int(252 * T), 50)
             _obs = np.linspace(T / _ns, T, _ns)
             _, _paths = heston_simulate_paths(
@@ -388,8 +371,9 @@ class MCPricer:
         barrier_hit = np.any(paths >= B, axis=1)
         ST          = paths[:, -1]
 
-        payoff_no_hit = np.maximum(2 * S0 - ST, X - ST)  # bonus inverse
+        # Put(2·S0) + call up-and-out(X, B)
         payoff_hit    = np.maximum(2 * S0 - ST, 0.0)
+        payoff_no_hit = payoff_hit + np.maximum(ST - X, 0.0)
 
         payoff = np.where(barrier_hit, payoff_hit, payoff_no_hit) * ratio
 
@@ -398,12 +382,16 @@ class MCPricer:
                                       control_mean=S0 * math.exp(-q * T))
 
         def pfn(S_arg, r, q, T, params=None):
-            _ST = heston_simulate(S=S_arg, r=r, q=q, T=T,
-                                  params=params or self.params,
-                                  n_paths=self.n_paths // 4,
-                                  antithetic=self.antithetic, seed=_GREEK_SEED)
-            return float(np.mean(np.maximum(2 * S0 - _ST, X - _ST)) * ratio
-                         * math.exp(-r * T))
+            _ns  = max(int(252 * T), 50)
+            _obs = np.linspace(T / _ns, T, _ns)
+            _, _paths = heston_simulate_paths(
+                S=S_arg, r=r, q=q, T=T, params=params or self.params,
+                n_paths=self.n_paths // 2, observation_times=_obs,
+                antithetic=self.antithetic, seed=_GREEK_SEED)
+            _hit = np.any(_paths >= B, axis=1)
+            _STe = _paths[:, -1]
+            _p   = np.maximum(2 * S0 - _STe, 0.0) + np.where(_hit, 0.0, np.maximum(_STe - X, 0.0))
+            return float(np.mean(_p) * ratio * math.exp(-r * T))
 
         greeks = compute_greeks_fd_heston(pfn, price, S0, r, q, T, self.params)
         return PricingResult(price=round(price, 6), greeks=greeks,
@@ -449,7 +437,7 @@ class MCPricer:
         Remboursement final : min(S_T, cap) × nominal/cap.
         Coupon fourni en input — pour le fair coupon, utiliser le mode AL.
         """
-        from pricing_lib.pricers.analytical import _cashflow_df, _coupon_dates, _freq_map
+        from pricing_lib.pricers.analytical import _cashflow_df, _schedule, _freq_map
 
         if start is None:
             start = self.snap.valuation_date
@@ -457,11 +445,9 @@ class MCPricer:
         S, r, q = self.S, self._rT(T), self.q
         df_T    = math.exp(-r * T)
 
-        # Échéancier de coupons (jambe obligataire) — actualisé au taux pour que
-        # le bump de taux le ré-actualise AUSSI (rho complet, pas seulement la
-        # jambe de remboursement). Le nominal est remboursé via la jambe MC,
-        # donc PAS compté ici (sinon double comptage).
-        _pay  = _coupon_dates(start, T, freq)
+        # Coupons actualisés au taux passé en argument (le bump de rho les touche
+        # aussi). Le nominal est dans la jambe MC.
+        _pay  = _schedule(start, T, freq, self.snap.valuation_date)
         _taus = np.array([(d - self.snap.valuation_date).days / 365.25 for d in _pay])
         _taus = _taus[_taus > 0]
         _c_per = coupon * nominal / _freq_map(freq)
@@ -471,7 +457,7 @@ class MCPricer:
 
         coupons_pv = _coupons_pv(r)
 
-        # Remboursement final par MC : min(S_T, cap)·nominal/cap (variable de contrôle)
+        # Remboursement : min(S_T, cap) · nominal / cap
         ST         = self._simulate(T)
         ratio_conv = nominal / cap
         payoff_T   = np.where(ST >= cap, nominal, ST * ratio_conv)
@@ -516,46 +502,17 @@ class MCPricer:
         F = self.S * math.exp((self.r - self.q) * T)
         return self._sigma(T, F)
 
-    def _get_participation(self, fn_name: str, *args) -> float:
-        """
-        [Obsolète — conservé pour compatibilité]
-        Calibrait le taux de participation via pdts (BS + vol locale).
-        Remplacé par _solve_participation (auto-cohérent sur les paths Heston).
-        """
-        try:
-            from pricing_lib.pricers.core import pdts
-            fn = getattr(pdts, fn_name)
-            return float(fn(*args))
-        except Exception as e:
-            print(f"[MC] Calibration participation ({fn_name}) échouée : {e} — part=1.0")
-            return 1.0
-
     @staticmethod
     def _solve_participation(base: np.ndarray, option: np.ndarray,
                              par: float, df: float) -> tuple:
         """
-        Participation fair AUTO-COHÉRENTE, résolue sur les MÊMES trajectoires
-        Heston que celles du pricing (zéro dépendance à Black-Scholes ou à la
-        vol locale).
-
-        Le payoff de ces produits est LINÉAIRE en `part` :
-            payoff = base(S_T) + part · option(S_T)
-        On résout `part` tel que le prix actualisé vaille le pair :
-            E[payoff]·df = par
-            ⇒  part = (par − E[base]·df) / (E[option]·df)
-
-        Le prix qui en découle vaut alors `par` par construction, et `part`
-        est le vrai niveau fair sous le modèle de pricing (Heston), pas sous
-        un modèle auxiliaire. base/option sont les payoffs NON scalés (ratio
-        appliqué ensuite).
-
-        Retourne (part, part_stderr) — l'erreur standard MC de la participation,
-        obtenue par delta method (ratio de deux moyennes MC corrélées) :
-            part = (par − μ_b)/μ_o,  ∂part/∂μ_b = −1/μ_o,  ∂part/∂μ_o = −(par−μ_b)/μ_o²
+        Participation fair sur les trajectoires simulées. Le payoff est linéaire
+        en part (base + part · option), donc part = (par − E[base]·df) / (E[option]·df).
+        Retourne (part, erreur standard par delta method).
         """
         n = len(base)
-        b = np.asarray(base,   dtype=float) * df   # base actualisée par trajectoire
-        o = np.asarray(option, dtype=float) * df   # option actualisée par trajectoire
+        b = np.asarray(base,   dtype=float) * df
+        o = np.asarray(option, dtype=float) * df
         mu_b = float(np.mean(b))
         mu_o = float(np.mean(o))
         if abs(mu_o) < 1e-10 or n < 2:
@@ -570,14 +527,18 @@ class MCPricer:
         var_part = g_b * g_b * var_b + g_o * g_o * var_o + 2.0 * g_b * g_o * cov_bo
         return part, math.sqrt(max(var_part, 0.0))
 
+    def _fixed_or_solved(self, part, base, option, par, df) -> tuple:
+        """Participation imposée si fournie, sinon fair."""
+        if part is not None:
+            return float(part), 0.0
+        return self._solve_participation(base, option, par, df)
+
     def outperformance_certificate(
-        self, X: float, T: float, ratio: float = 1.0,
+        self, X: float, T: float, ratio: float = 1.0, part: Optional[float] = None,
     ) -> PricingResult:
         """
         Outperformance Certificate MC.
-        Payoff = S_T + (part − 1) × max(S_T − X, 0)   [convention AL : participation TOTALE]
-        Participation fair résolue AUTO-COHÉRENTE sur les trajectoires Heston
-        (prix = pair par construction).
+        Payoff = S_T + (part − 1) × max(S_T − X, 0)
         """
         S, r, q = self.S, self._rT(T), self.q
         df = math.exp(-r * T)
@@ -585,7 +546,7 @@ class MCPricer:
         ST     = self._simulate(T)
         option = np.maximum(ST - X, 0.0)
         base   = ST - option                 # part = participation TOTALE (= 1 + incrémentale)
-        part, part_se = self._solve_participation(base, option, S, df)
+        part, part_se = self._fixed_or_solved(part, base, option, S, df)
 
         payoff = (base + part * option) * ratio
         price  = float(np.mean(payoff) * df)
@@ -604,24 +565,24 @@ class MCPricer:
                             ticker=self.snap.ticker,
                             product="Outperformance Certificate", model="heston_mc")
         res.fair_participation = round(part, 6)
-        res.mc_stderr = round(part_se, 6)   # incertitude MC sur la participation (prix = pair exact)
+        res.mc_stderr = round(part_se, 6)
         return res
 
     def sprint_certificate(
         self, X: float, cap: float, T: float, ratio: float = 1.0,
+        part: Optional[float] = None,
     ) -> PricingResult:
         """
-        Sprint Certificate MC (convention AL canonique).
-        Payoff = S_T + (part − 1) × (max(S_T − X, 0) − 2·max(S_T − cap, 0))
-        Participation fair auto-cohérente sur les trajectoires Heston.
+        Sprint Certificate MC.
+        Payoff = S_T + (part − 1)·(S_T − X)⁺ − part·(S_T − cap)⁺
         """
         S, r, q = self.S, self._rT(T), self.q
         df = math.exp(-r * T)
 
         ST     = self._simulate(T)
-        option = np.maximum(ST - X, 0.0) - 2.0 * np.maximum(ST - cap, 0.0)
-        base   = ST - option
-        part, part_se = self._solve_participation(base, option, S, df)
+        option = np.maximum(ST - X, 0.0) - np.maximum(ST - cap, 0.0)
+        base   = ST - np.maximum(ST - X, 0.0)
+        part, part_se = self._fixed_or_solved(part, base, option, S, df)
 
         payoff = (base + part * option) * ratio
         price  = float(np.mean(payoff) * df)
@@ -631,8 +592,9 @@ class MCPricer:
                                   params=params or self.params,
                                   n_paths=self.n_paths,
                                   antithetic=self.antithetic, seed=_GREEK_SEED)
-            _opt = np.maximum(_ST - X, 0.0) - 2.0 * np.maximum(_ST - cap, 0.0)
-            return float(np.mean((_ST - _opt + part * _opt) * ratio)
+            _opt  = np.maximum(_ST - X, 0.0) - np.maximum(_ST - cap, 0.0)
+            _base = _ST - np.maximum(_ST - X, 0.0)
+            return float(np.mean((_base + part * _opt) * ratio)
                          * math.exp(-r * T))
 
         greeks = compute_greeks_fd_heston(pfn, price, S, r, q, T, self.params)
@@ -640,17 +602,15 @@ class MCPricer:
                             ticker=self.snap.ticker,
                             product="Sprint Certificate", model="heston_mc")
         res.fair_participation = round(part, 6)
-        res.mc_stderr = round(part_se, 6)   # incertitude MC sur la participation (prix = pair exact)
+        res.mc_stderr = round(part_se, 6)
         return res
 
     def twin_win_certificate(
         self, X: float, B: float, T: float, ratio: float = 1.0,
+        part: Optional[float] = None,
     ) -> PricingResult:
         """
-        Twin Win Certificate MC (convention AL : ZSC + (part−1)·call(X) + 2·DOP(X,B)).
-        DOP = put down-and-out (paie max(X−S_T,0) si la barrière basse B n'a
-        jamais été touchée) → transforme la baisse en gain tant que B tient.
-        Participation fair auto-cohérente sur les trajectoires Heston.
+        Twin Win Certificate MC : ZSC + (part−1)·call(X) + 2·put down-and-out(X, B).
         """
         S, r, q = self.S, self._rT(T), self.q
         n_steps   = max(int(252 * T), 50)
@@ -665,13 +625,12 @@ class MCPricer:
         option = np.maximum(ST - X, 0.0)
         dop    = np.where(barrier_hit, 0.0, np.maximum(X - ST, 0.0))   # down-and-out put
         base   = ST - option + 2.0 * dop
-        part, part_se = self._solve_participation(base, option, S, df)
+        part, part_se = self._fixed_or_solved(part, base, option, S, df)
 
         payoff = (base + part * option) * ratio
         price  = float(np.mean(payoff) * df)
 
         def pfn(S_arg, r, q, T, params=None):
-            # Barrière basse CONSERVÉE dans le bump (monitoring continu sur chemins).
             _ns  = max(int(252 * T), 50)
             _obs = np.linspace(T / _ns, T, _ns)
             _, _paths = heston_simulate_paths(
@@ -690,16 +649,15 @@ class MCPricer:
                             ticker=self.snap.ticker,
                             product="Twin Win Certificate", model="heston_mc")
         res.fair_participation = round(part, 6)
-        res.mc_stderr = round(part_se, 6)   # incertitude MC sur la participation (prix = pair exact)
+        res.mc_stderr = round(part_se, 6)
         return res
 
     def airbag_certificate(
         self, X: float, B: float, T: float, ratio: float = 1.0,
+        part: Optional[float] = None,
     ) -> PricingResult:
         """
-        Airbag Certificate MC (convention AL : cash(X) + part·call(X) − (X/B)·put(B)).
-        Capital X protégé ; au-dessus de X, participation ; sous la barrière B,
-        perte amplifiée par le ratio X/B (le « dégonflage » de l'airbag).
+        Airbag Certificate MC : X + part·call(X) − (X/B)·put(B).
         """
         S, r, q = self.S, self._rT(T), self.q
         df = math.exp(-r * T)
@@ -707,7 +665,7 @@ class MCPricer:
         ST = self._simulate(T)
         option = np.maximum(ST - X, 0.0)
         base   = X - (X / B) * np.maximum(B - ST, 0.0)   # cash X − (X/B)·put(B)
-        part, part_se = self._solve_participation(base, option, S, df)
+        part, part_se = self._fixed_or_solved(part, base, option, S, df)
 
         payoff = (base + part * option) * ratio
         price  = float(np.mean(payoff) * df)
@@ -726,23 +684,25 @@ class MCPricer:
                             ticker=self.snap.ticker,
                             product="Airbag Certificate", model="heston_mc")
         res.fair_participation = round(part, 6)
-        res.mc_stderr = round(part_se, 6)   # incertitude MC sur la participation (prix = pair exact)
+        res.mc_stderr = round(part_se, 6)
         return res
 
     def garantie_certificate(
         self, X: float, T: float, nominal: float = 100.0, ratio: float = 1.0,
+        part: Optional[float] = None,
     ) -> PricingResult:
         """
         Garantie Certificate MC.
-        Payoff = nominal + part × max(S_T − X, 0)
+        Payoff = nominal · [1 + part · (S_T/X − 1)⁺]
         """
         S, r, q = self.S, self._rT(T), self.q
         df = math.exp(-r * T)
+        k  = float(nominal) / X
 
         ST     = self._simulate(T)
         base   = np.full_like(ST, float(nominal))   # capital garanti
-        option = np.maximum(ST - X, 0.0)
-        part, part_se = self._solve_participation(base, option, float(nominal), df)
+        option = k * np.maximum(ST - X, 0.0)
+        part, part_se = self._fixed_or_solved(part, base, option, float(nominal), df)
 
         payoff = (base + part * option) * ratio
         price  = float(np.mean(payoff) * df)
@@ -752,7 +712,7 @@ class MCPricer:
                                   params=params or self.params,
                                   n_paths=self.n_paths,
                                   antithetic=self.antithetic, seed=_GREEK_SEED)
-            _p = (nominal + part * np.maximum(_ST - X, 0.0)) * ratio
+            _p = (nominal + part * k * np.maximum(_ST - X, 0.0)) * ratio
             return float(np.mean(_p) * math.exp(-r * T))
 
         greeks = compute_greeks_fd_heston(pfn, price, S, r, q, T, self.params)
@@ -760,7 +720,7 @@ class MCPricer:
                             ticker=self.snap.ticker,
                             product="Garantie Certificate", model="heston_mc")
         res.fair_participation = round(part, 6)
-        res.mc_stderr = round(part_se, 6)   # incertitude MC sur la participation (prix = pair exact)
+        res.mc_stderr = round(part_se, 6)
         return res
 
        

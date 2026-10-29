@@ -16,8 +16,9 @@ Deux modes disponibles pour chaque produit
       Coupon en entrée (paramètre `coupon`).
       Simule les trajectoires Heston → actualise les vrais flux path-by-path
       → retourne le prix en % du nominal.
-      Le coupon_fair est calculé en bonus (info) avec la même formule.
-      Exemple : coupon=0.10 → prix=107 % → coupon trop élevé.
+      Le coupon_fair est aussi renvoyé à titre indicatif.
+
+Les coupons sont exprimés par période d'observation.
 """
 
 from __future__ import annotations
@@ -41,15 +42,24 @@ from pricing_lib.pricers.mc import get_heston_params
 
 
 def _fwd_rate(ois_curve, T: float) -> float:
-    """
-    Taux forward OIS continu jusqu'à T : r_T = −ln(df(T))/T.
-
-    Utilisé comme drift de simulation des autocalls (cohérent avec les pricers
-    mono-maturité). Avec une courbe décalée (_BumpedMarket), r_T se décale aussi
-    → le bump de taux touche drift ET actualisation (rho complet).
-    """
+    """Taux zéro continu OIS jusqu'à T, utilisé comme drift de simulation."""
     T = max(float(T), 1e-6)
     return -math.log(max(ois_curve.df_tau(T), 1e-12)) / T
+
+
+# ─── Barrières : fraction de S0 ou niveau absolu ─────────────────────────────
+
+_FRACTION_MAX = 3.0
+
+
+def barrier_level(x: float, S0: float) -> float:
+    """
+    x ≤ 3 : fraction de S0 (0.70 = 70 %), sinon niveau absolu.
+    """
+    if x is None:
+        return x
+    x = float(x)
+    return x * float(S0) if x <= _FRACTION_MAX else x
 
 
 # ─── Helpers dates ────────────────────────────────────────────────────────────
@@ -71,6 +81,21 @@ def _observation_dates(start: date, freq_months: int, maturity_months: int):
             break
     taus = np.array([(d - start).days / 365.25 for d in dates])
     return dates, taus
+
+
+def _future_schedule(dates, valuation_date: date):
+    """
+    Dates d'observation postérieures à valuation_date.
+    Retourne (dates, taus, k0), k0 = nombre de dates déjà passées.
+    Suppose le produit encore vivant : les fixings passés sont gérés par
+    l'appelant (backtest/engine.py).
+    """
+    fut = [d for d in dates if d > valuation_date]
+    if not fut:
+        raise ValueError(f"Produit échu au {valuation_date} : plus aucune date d'observation.")
+    k0   = len(dates) - len(fut)
+    taus = np.array([(d - valuation_date).days / 365.25 for d in fut])
+    return fut, taus, k0
 
 
 # ─── Phoenix ──────────────────────────────────────────────────────────────────
@@ -102,6 +127,8 @@ class PhoenixPricer:
         params: Optional[HestonParams] = None,
         antithetic: bool = True,
         seed: Optional[int] = None,
+        valuation_date: Optional[date] = None,
+        spot: Optional[float] = None,
     ):
         self.snap             = snapshot
         self.n_paths          = n_paths
@@ -113,6 +140,7 @@ class PhoenixPricer:
         self.freq_months      = freq_months
         self.maturity_months  = maturity_months
         self.kg               = kg.lower()
+        self._autocall_start_global = autocall_start
         self.autocall_start   = autocall_start
         self.mode             = mode.upper()
         self.coupon           = coupon
@@ -121,18 +149,27 @@ class PhoenixPricer:
         self.seed             = seed
         self.params           = params or get_heston_params(snapshot)
 
-        self.obs_dates, self.obs_taus = _observation_dates(
-            start_date, freq_months, maturity_months
-        )
+        # S0 : niveau de référence (perte = S_T/S0). spot : point de départ des
+        # simulations, différent de S0 en cours de vie.
+        self.spot           = float(spot) if spot is not None else float(S0)
+        self.valuation_date = (valuation_date
+                               or getattr(snapshot, "valuation_date", None)
+                               or start_date)
+        if self.valuation_date < start_date:
+            self.valuation_date = start_date
+        all_dates, _ = _observation_dates(start_date, freq_months, maturity_months)
+        self.obs_dates, self.obs_taus, self.k0 = _future_schedule(all_dates, self.valuation_date)
+        self.n_total   = len(all_dates)
         self.n_periods = len(self.obs_dates)
         self.T         = self.obs_taus[-1]
+        self.autocall_start = max(self._autocall_start_global - self.k0, 0)
 
     # ── Simulation ────────────────────────────────────────────────────────────
 
     def _simulate(self) -> np.ndarray:
         """Simule les trajectoires — retourne paths (n_paths, n_periods)."""
         _, paths = heston_simulate_paths(
-            S=self.S0,
+            S=self.spot,
             r=_fwd_rate(self.snap.ois_curve, self.T),   # drift = r_T (forward à maturité)
             q=self.snap.q,
             T=self.T,
@@ -246,38 +283,33 @@ class PhoenixPricer:
 
     def _compute_greeks(self, price_0: float, fair_coupon: float = None) -> dict:
         """
-        Sensibilités par différences finies CENTRÉES (re-simulation à n_paths//8,
-        même seed), convention unifiée avec le reste de la lib + bloc p_*.
-        Delta / Gamma : S ± dS.
-        Vega          : shift parallèle ±1 pt de vol sur √v0 ET √θ.
-        Rho           : ± dr via courbe OIS décalée (_BumpedMarket).
-        Theta         : ± 1 jour calendaire (start_date ∓ 1j).
-
-        Mode AL : le coupon_fair est figé (paramètre fair_coupon) et les
-        bumps sont pricés en MC — sinon chaque bump reprice en AL et donne
-        toujours ~100 %, ce qui annule delta/gamma.
+        Différences finies centrées, re-simulation à n_paths//8 avec le même seed.
+        Delta/gamma sur le spot, vega = ±1 pt sur √v0 et √θ, rho via la courbe
+        décalée, theta = date de valo ± 1 jour.
+        En mode AL, le coupon fair est figé et les bumps sont pricés en MC.
         """
         from datetime import timedelta
         from pricing_lib.risk.greeks import _assemble, _BumpedMarket
 
         n_bump = max(self.n_paths // 8, 500)
-        dS     = self.S0 * 0.01
+        dS     = self.spot * 0.01
         dvol   = 0.01      # 1 point de vol
         dr     = 0.0001
 
-        # Mode AL : on fixe le coupon et on passe en MC pour les bumps
         coupon_b = fair_coupon if (self.mode == "AL" and fair_coupon is not None) \
                    else self.coupon
 
-        def _sub_price(S0_new, params_new=None, snap_new=None, start_new=None) -> float:
+        def _sub_price(S_new, params_new=None, snap_new=None, val_new=None) -> float:
             p  = params_new if params_new is not None else self.params
             sn = snap_new   if snap_new   is not None else self.snap
-            sd = start_new  if start_new  is not None else self.start_date
+            vd = val_new    if val_new    is not None else self.valuation_date
             sub = PhoenixPricer(
-                sn, n_bump, sd, S0_new,
+                sn, n_bump, self.start_date, self.S0,
                 self.barrier_coupon, self.barrier_recall, self.capital_barrier,
-                self.freq_months, self.maturity_months, self.kg, self.autocall_start,
+                self.freq_months, self.maturity_months, self.kg,
+                self._autocall_start_global,
                 mode="MC", coupon=coupon_b, params=p, seed=self.seed,
+                valuation_date=vd, spot=S_new,
             )
             return sub._compute_mc(sub._simulate()).price
 
@@ -287,33 +319,30 @@ class PhoenixPricer:
             except Exception:
                 return fallback
 
-        # Prix de base MC (AL : price_0 ≈ 100 % → on reprice en MC à coupon figé)
-        # p_0 du bloc Greeks recalculé AU MÊME seed/n_bump que les chocs
-        # (sinon gamma contaminé par le décalage de trajectoires). Le prix
-        # affiché du produit reste price_0 (pleine résolution).
-        p0 = _safe(lambda: _sub_price(self.S0), price_0)
+        # p0 au même seed et nombre de chemins que les chocs
+        p0 = _safe(lambda: _sub_price(self.spot), price_0)
 
         # Spot ± dS (delta, gamma)
-        p_S_up   = _safe(lambda: _sub_price(self.S0 + dS), p0)
-        p_S_down = _safe(lambda: _sub_price(self.S0 - dS), p0)
+        p_S_up   = _safe(lambda: _sub_price(self.spot + dS), p0)
+        p_S_down = _safe(lambda: _sub_price(self.spot - dS), p0)
 
-        # Vol : shift parallèle ± dvol points sur √v0 et √θ, reconvertis en variance
+        # Vol : ± dvol sur √v0 et √θ
         vol_v0 = math.sqrt(max(self.params.v0,    0.0))
         vol_th = math.sqrt(max(self.params.theta, 0.0))
         par_up = _dc_replace(self.params, v0=(vol_v0 + dvol) ** 2,
                                           theta=(vol_th + dvol) ** 2)
         par_dn = _dc_replace(self.params, v0=max(vol_v0 - dvol, 1e-4) ** 2,
                                           theta=max(vol_th - dvol, 1e-4) ** 2)
-        p_vol_up   = _safe(lambda: _sub_price(self.S0, params_new=par_up), p0)
-        p_vol_down = _safe(lambda: _sub_price(self.S0, params_new=par_dn), p0)
+        p_vol_up   = _safe(lambda: _sub_price(self.spot, params_new=par_up), p0)
+        p_vol_down = _safe(lambda: _sub_price(self.spot, params_new=par_dn), p0)
 
-        # Taux ± dr (courbe OIS décalée, forme préservée)
-        p_r_up   = _safe(lambda: _sub_price(self.S0, snap_new=_BumpedMarket(self.snap, rate_bump=+dr)), p0)
-        p_r_down = _safe(lambda: _sub_price(self.S0, snap_new=_BumpedMarket(self.snap, rate_bump=-dr)), p0)
+        # Taux ± dr
+        p_r_up   = _safe(lambda: _sub_price(self.spot, snap_new=_BumpedMarket(self.snap, rate_bump=+dr)), p0)
+        p_r_down = _safe(lambda: _sub_price(self.spot, snap_new=_BumpedMarket(self.snap, rate_bump=-dr)), p0)
 
-        # Temps ± 1 jour : +1j = maturité plus courte (p_T_down) ; −1j = plus longue (p_T_up)
-        p_T_down = _safe(lambda: _sub_price(self.S0, start_new=self.start_date + timedelta(days=1)), p0)
-        p_T_up   = _safe(lambda: _sub_price(self.S0, start_new=self.start_date - timedelta(days=1)), p0)
+        # Theta : date de valorisation ± 1 jour, échéancier inchangé
+        p_T_down = _safe(lambda: _sub_price(self.spot, val_new=self.valuation_date + timedelta(days=1)), p0)
+        p_T_up   = _safe(lambda: _sub_price(self.spot, val_new=self.valuation_date - timedelta(days=1)), p0)
 
         return _assemble(
             p0,
@@ -372,6 +401,7 @@ class PhoenixPricer:
             product=f"Phoenix AL {'KG' if self.kg=='yes' else 'Capital Risque'}",
             model="heston_repl",
             fair_coupon=round(float(coupon_fair), 6),
+            coupon_periods_per_year=12 // self.freq_months,
             cashflows=cf_df,
             probabilities=prob_df,
         )
@@ -462,6 +492,7 @@ class PhoenixPricer:
             product=f"Phoenix MC {'KG' if self.kg=='yes' else 'Capital Risque'}",
             model="heston_mc",
             fair_coupon=round(float(coupon_fair), 6),
+            coupon_periods_per_year=12 // self.freq_months,
             cashflows=cf_df,
             probabilities=prob_df,
         )
@@ -496,6 +527,8 @@ class AthenaPricer:
         params: Optional[HestonParams] = None,
         antithetic: bool = True,
         seed: Optional[int] = None,
+        valuation_date: Optional[date] = None,
+        spot: Optional[float] = None,
     ):
         self.snap            = snapshot
         self.n_paths         = n_paths
@@ -513,9 +546,17 @@ class AthenaPricer:
         self.seed            = seed
         self.params          = params or get_heston_params(snapshot)
 
-        self.obs_dates, self.obs_taus = _observation_dates(
-            start_date, freq_months, maturity_months
-        )
+        # S0 : niveau de référence (perte = S_T/S0). spot : point de départ des
+        # simulations, différent de S0 en cours de vie.
+        self.spot           = float(spot) if spot is not None else float(S0)
+        self.valuation_date = (valuation_date
+                               or getattr(snapshot, "valuation_date", None)
+                               or start_date)
+        if self.valuation_date < start_date:
+            self.valuation_date = start_date
+        all_dates, _ = _observation_dates(start_date, freq_months, maturity_months)
+        self.obs_dates, self.obs_taus, self.k0 = _future_schedule(all_dates, self.valuation_date)
+        self.n_total   = len(all_dates)
         self.n_periods = len(self.obs_dates)
         self.T         = self.obs_taus[-1]
 
@@ -523,7 +564,7 @@ class AthenaPricer:
 
     def price(self) -> PricingResult:
         _, paths = heston_simulate_paths(
-            S=self.S0, r=_fwd_rate(self.snap.ois_curve, self.T), q=self.snap.q, T=self.T,
+            S=self.spot, r=_fwd_rate(self.snap.ois_curve, self.T), q=self.snap.q, T=self.T,
             params=self.params, n_paths=self.n_paths,
             observation_times=self.obs_taus,
             antithetic=self.antithetic, seed=self.seed,
@@ -536,13 +577,8 @@ class AthenaPricer:
 
     def _build_masks(self, paths: np.ndarray):
         trigger_r = paths > self.barrier_recall
-        # Bug #8 fix : cumul_r[:, i] doit indiquer qu'un autocall a eu lieu
-        # STRICTEMENT AVANT la période i, pas à la période i elle-même.
-        # np.cumsum > 0 marque la période i comme "déjà autocallée" dès que
-        # trigger_r[:, i] est True, ce qui empêche de compter le flux à T_i.
-        # Correct : décaler d'une colonne (shifted cumsum).
+        # cumul_r[:, i] : rappel déclenché sur une date strictement antérieure à i
         cumsum = np.cumsum(trigger_r, axis=1)
-        # cumul_r[:, i] = True ssi un trigger a eu lieu en [0, i-1]
         cumul_r = np.zeros_like(trigger_r, dtype=bool)
         cumul_r[:, 1:] = cumsum[:, :-1] > 0
         has_trigger = trigger_r[:, :-1].any(axis=1)
@@ -552,7 +588,7 @@ class AthenaPricer:
         n_paths, n_periods = paths.shape
         p_recall, c_recall = [], []
         for i in range(n_periods - 1):
-            cond = trigger_r[:, i] if i == 0 else trigger_r[:, i] & ~cumul_r[:, i - 1]
+            cond = trigger_r[:, i] & ~cumul_r[:, i]
             p_recall.append(float(cond.mean()))
             c_recall.append(int(cond.sum()))
         n_no = int(no_trigger.sum())
@@ -567,7 +603,8 @@ class AthenaPricer:
         ST_no = ST[no_trigger]
         df_T = dfs[-1]
 
-        Sum_A_i = sum(p_recall[i] * dfs[i] * (i + 1) for i in range(n_periods - 1))
+        Sum_A_i = sum(p_recall[i] * dfs[i] * (self.k0 + i + 1) for i in range(n_periods - 1))
+        n_mem   = self.n_total
         Sum_A   = sum(p_recall[i] * dfs[i]            for i in range(n_periods - 1))
 
         if self.kg == "no":
@@ -577,11 +614,11 @@ class AthenaPricer:
             prob_loss = float(mask_loss.mean()) if len(mask_loss) > 0 else 0.0
             payoff_moy = float((ST_no[mask_loss] / S0).mean()) if mask_loss.sum() > 0 else 0.0
             num   = 1.0 - (Sum_A + p_no * df_T * (prob_h + payoff_moy * prob_loss))
-            denom = Sum_A_i + n_periods * p_no * df_T * prob_h
+            denom = Sum_A_i + n_mem * p_no * df_T * prob_h
         else:
             prob_h = 1.0; prob_loss = 0.0; payoff_moy = 0.0
             num   = 1.0 - (Sum_A + p_no * df_T)
-            denom = Sum_A_i + n_periods * p_no * df_T
+            denom = Sum_A_i + n_mem * p_no * df_T
 
         coupon_fair = num / denom if denom > 1e-10 else 0.0
         return coupon_fair, Sum_A, Sum_A_i, prob_h, prob_loss, payoff_moy
@@ -590,34 +627,32 @@ class AthenaPricer:
 
     def _compute_greeks(self, price_0: float, fair_coupon: float = None) -> dict:
         """
-        Différences finies CENTRÉES, convention unifiée + bloc p_* (cf.
-        PhoenixPricer._compute_greeks). Delta/Gamma sur S, Vega = shift parallèle
-        ±1 pt de vol (√v0, √θ), Rho via courbe décalée, Theta ±1 jour.
-        Mode AL : coupon_fair figé, bumps pricés en MC.
+        Même méthode que PhoenixPricer._compute_greeks.
         """
         from datetime import timedelta
         from pricing_lib.risk.greeks import _assemble, _BumpedMarket
 
         n_bump = max(self.n_paths // 8, 500)
-        dS     = self.S0 * 0.01
+        dS     = self.spot * 0.01
         dvol   = 0.01
         dr     = 0.0001
 
         coupon_b = fair_coupon if (self.mode == "AL" and fair_coupon is not None) \
                    else self.coupon
 
-        def _sub_price(S0_new, params_new=None, snap_new=None, start_new=None) -> float:
+        def _sub_price(S_new, params_new=None, snap_new=None, val_new=None) -> float:
             p  = params_new if params_new is not None else self.params
             sn = snap_new   if snap_new   is not None else self.snap
-            sd = start_new  if start_new  is not None else self.start_date
+            vd = val_new    if val_new    is not None else self.valuation_date
             sub = AthenaPricer(
-                sn, n_bump, sd, S0_new,
+                sn, n_bump, self.start_date, self.S0,
                 self.barrier_recall, self.capital_barrier,
                 self.freq_months, self.maturity_months, self.kg,
                 mode="MC", coupon=coupon_b, params=p, seed=self.seed,
+                valuation_date=vd, spot=S_new,
             )
             _, paths_sub = heston_simulate_paths(
-                S=S0_new, r=_fwd_rate(sn.ois_curve, sub.T), q=sn.q, T=sub.T,
+                S=S_new, r=_fwd_rate(sn.ois_curve, sub.T), q=sn.q, T=sub.T,
                 params=p, n_paths=n_bump,
                 observation_times=sub.obs_taus,
                 antithetic=sub.antithetic, seed=sub.seed,
@@ -630,13 +665,11 @@ class AthenaPricer:
             except Exception:
                 return fallback
 
-        # p_0 du bloc Greeks recalculé AU MÊME seed/n_bump que les chocs
-        # (sinon gamma contaminé par le décalage de trajectoires). Le prix
-        # affiché du produit reste price_0 (pleine résolution).
-        p0 = _safe(lambda: _sub_price(self.S0), price_0)
+        # p0 au même seed et nombre de chemins que les chocs
+        p0 = _safe(lambda: _sub_price(self.spot), price_0)
 
-        p_S_up   = _safe(lambda: _sub_price(self.S0 + dS), p0)
-        p_S_down = _safe(lambda: _sub_price(self.S0 - dS), p0)
+        p_S_up   = _safe(lambda: _sub_price(self.spot + dS), p0)
+        p_S_down = _safe(lambda: _sub_price(self.spot - dS), p0)
 
         vol_v0 = math.sqrt(max(self.params.v0,    0.0))
         vol_th = math.sqrt(max(self.params.theta, 0.0))
@@ -644,14 +677,15 @@ class AthenaPricer:
                                           theta=(vol_th + dvol) ** 2)
         par_dn = _dc_replace(self.params, v0=max(vol_v0 - dvol, 1e-4) ** 2,
                                           theta=max(vol_th - dvol, 1e-4) ** 2)
-        p_vol_up   = _safe(lambda: _sub_price(self.S0, params_new=par_up), p0)
-        p_vol_down = _safe(lambda: _sub_price(self.S0, params_new=par_dn), p0)
+        p_vol_up   = _safe(lambda: _sub_price(self.spot, params_new=par_up), p0)
+        p_vol_down = _safe(lambda: _sub_price(self.spot, params_new=par_dn), p0)
 
-        p_r_up   = _safe(lambda: _sub_price(self.S0, snap_new=_BumpedMarket(self.snap, rate_bump=+dr)), p0)
-        p_r_down = _safe(lambda: _sub_price(self.S0, snap_new=_BumpedMarket(self.snap, rate_bump=-dr)), p0)
+        p_r_up   = _safe(lambda: _sub_price(self.spot, snap_new=_BumpedMarket(self.snap, rate_bump=+dr)), p0)
+        p_r_down = _safe(lambda: _sub_price(self.spot, snap_new=_BumpedMarket(self.snap, rate_bump=-dr)), p0)
 
-        p_T_down = _safe(lambda: _sub_price(self.S0, start_new=self.start_date + timedelta(days=1)), p0)
-        p_T_up   = _safe(lambda: _sub_price(self.S0, start_new=self.start_date - timedelta(days=1)), p0)
+        # Theta : date de valorisation ± 1 jour, échéancier inchangé
+        p_T_down = _safe(lambda: _sub_price(self.spot, val_new=self.valuation_date + timedelta(days=1)), p0)
+        p_T_up   = _safe(lambda: _sub_price(self.spot, val_new=self.valuation_date - timedelta(days=1)), p0)
 
         return _assemble(
             p0,
@@ -681,11 +715,11 @@ class AthenaPricer:
         if self.kg == "no":
             price = (Sum_A + coupon_fair * Sum_A_i
                      + p_no * df_T * (prob_h + payoff_moy * prob_loss)
-                     + coupon_fair * n_periods * p_no * df_T * prob_h) * 100.0
+                     + coupon_fair * self.n_total * p_no * df_T * prob_h) * 100.0
         else:
             price = (Sum_A + coupon_fair * Sum_A_i
                      + p_no * df_T
-                     + coupon_fair * n_periods * p_no * df_T) * 100.0
+                     + coupon_fair * self.n_total * p_no * df_T) * 100.0
 
         prob_df = pd.DataFrame({
             "Date":        [str(d) for d in self.obs_dates[:-1]] + [str(self.obs_dates[-1])],
@@ -699,9 +733,9 @@ class AthenaPricer:
         cf_df = pd.DataFrame({
             "Date":      [str(d) for d in self.obs_dates],
             "DF":        dfs.round(6),
-            "Mémoire":   list(range(1, n_periods + 1)),
+            "Mémoire":   list(range(self.k0 + 1, self.k0 + n_periods + 1)),
             "PV_coupon": (np.array(p_recall + [p_no]) * dfs
-                          * np.arange(1, n_periods + 1) * coupon_fair).round(6),
+                          * np.arange(self.k0 + 1, self.k0 + n_periods + 1) * coupon_fair).round(6),
         })
 
         greeks = self._compute_greeks(price, fair_coupon=coupon_fair) if self.compute_greeks \
@@ -714,6 +748,7 @@ class AthenaPricer:
             product=f"Athena AL {'KG' if self.kg=='yes' else 'Capital Risque'}",
             model="heston_repl",
             fair_coupon=round(float(coupon_fair), 6),
+            coupon_periods_per_year=12 // self.freq_months,
             cashflows=cf_df,
             probabilities=prob_df,
         )
@@ -737,22 +772,19 @@ class AthenaPricer:
         payoff = np.zeros((n_paths, n_periods))
 
         for i in range(n_periods - 1):
-            if i == 0:
-                mask_ac = trigger_r[:, i]
-            else:
-                mask_ac = trigger_r[:, i] & ~cumul_r[:, i - 1]
-            # Autocall T_i : nominal + (i+1) × coupon  (effet mémoire)
-            payoff[mask_ac, i] = 1.0 + (i + 1) * coupon
+            mask_ac = trigger_r[:, i] & ~cumul_r[:, i]
+            # nominal + coupons mémorisés
+            payoff[mask_ac, i] = 1.0 + (self.k0 + i + 1) * coupon
 
         # Payoff final
         ST = paths[:, -1]
         if self.kg == "no":
             mask_h    = no_trigger & (ST >= self.capital_barrier)
             mask_loss = no_trigger & (ST <  self.capital_barrier)
-            payoff[mask_h,    -1] = 1.0 + n_periods * coupon
+            payoff[mask_h,    -1] = 1.0 + self.n_total * coupon
             payoff[mask_loss, -1] = ST[mask_loss] / S0
         else:
-            payoff[no_trigger, -1] = 1.0 + n_periods * coupon
+            payoff[no_trigger, -1] = 1.0 + self.n_total * coupon
 
         # Prix actualisé
         pv    = (payoff * dfs[np.newaxis, :]).sum(axis=1)
@@ -777,9 +809,9 @@ class AthenaPricer:
         cf_df = pd.DataFrame({
             "Date":      [str(d) for d in self.obs_dates],
             "DF":        dfs.round(6),
-            "Mémoire":   list(range(1, n_periods + 1)),
+            "Mémoire":   list(range(self.k0 + 1, self.k0 + n_periods + 1)),
             "PV_coupon": (np.array(p_recall + [p_no]) * dfs
-                          * np.arange(1, n_periods + 1) * coupon).round(6),
+                          * np.arange(self.k0 + 1, self.k0 + n_periods + 1) * coupon).round(6),
         })
 
         greeks = self._compute_greeks(price) if self.compute_greeks \
@@ -792,6 +824,7 @@ class AthenaPricer:
             product=f"Athena MC {'KG' if self.kg=='yes' else 'Capital Risque'}",
             model="heston_mc",
             fair_coupon=round(float(coupon_fair), 6),
+            coupon_periods_per_year=12 // self.freq_months,
             cashflows=cf_df,
             probabilities=prob_df,
         )

@@ -44,7 +44,9 @@ class PricingResult:
     cashflows:          Optional[pd.DataFrame] = None
     probabilities:      Optional[pd.DataFrame] = None
     bs_params:          Optional[Dict]         = None
-    mc_stderr:          Optional[float]        = None   # erreur standard MC du prix   # paramètres BS utilisés (analytique)
+    mc_stderr:          Optional[float]        = None   # erreur standard MC du prix
+    # autocalls : coupon par période, nombre de périodes par an pour l'affichage
+    coupon_periods_per_year: Optional[int]     = None
 
     def __repr__(self) -> str:
         sep = "═" * 55
@@ -59,7 +61,12 @@ class PricingResult:
             lines.append(f"  Erreur std MC     : ±{self.mc_stderr:>9.4f}  "
                          f"(IC95% ±{1.96*self.mc_stderr:.4f})")
         if self.fair_coupon is not None:
-            lines.append(f"  Coupon fair       : {self.fair_coupon*100:>9.3f}% p.a.")
+            if self.coupon_periods_per_year:
+                n = self.coupon_periods_per_year
+                lines.append(f"  Coupon fair       : {self.fair_coupon*100:>9.3f}% par période "
+                             f"(≈ {self.fair_coupon*n*100:.3f}% p.a., {n} obs./an)")
+            else:
+                lines.append(f"  Coupon fair       : {self.fair_coupon*100:>9.3f}% p.a.")
         if self.fair_participation is not None:
             lines.append(f"  Participation fair: {self.fair_participation*100:>9.1f}%")
 

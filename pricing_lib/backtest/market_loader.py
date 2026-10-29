@@ -26,15 +26,12 @@ from pricing_lib.market_data.rates import fetch_ois_curve, OISCurve
 from pricing_lib.market_data.dividends import fetch_dividend, DividendCurve
 from pricing_lib.market_data.vol_surface import VolSurface
 
-# Mapping ticker CAC40 → symbole yfinance
+# Symboles yfinance : TICKER.PA par défaut, exceptions ci-dessous
 _YF_MAP: dict[str, str] = {
-    "GLE": "GLE.PA", "OR":  "OR.PA",  "MC":  "MC.PA",  "TTE": "TTE.PA",
-    "BNP": "BNP.PA", "SAN": "SAN.PA", "AI":  "AI.PA",  "AIR": "AIR.PA",
-    "AXA": "CS.PA",  "CA":  "ACA.PA", "DG":  "DG.PA",  "EN":  "ENGI.PA",
-    "HO":  "HO.PA",  "KER": "KER.PA", "LR":  "LR.PA",  "ML":  "ML.PA",
-    "MT":  "MT.AS",  "PUB": "PUB.PA", "RMS": "RMS.PA", "SAF": "SAF.PA",
-    "SGO": "SGO.PA", "SU":  "SU.PA",  "URW": "URW.AS", "VIE": "VIE.PA",
-    "VIV": "VIV.PA",
+    "AXA":   "CS.PA",
+    "MT":    "MT.AS",
+    "URW":   "URW.AS",
+    "STLAP": "STLAP.PA", "STMPA": "STMPA.PA",
 }
 
 # Vol réalisée par défaut si pas assez de données (25%)
@@ -108,7 +105,12 @@ def fetch_live_market_data(
     Retourne (ois_curve, div_curve).
     """
     ticker = ticker.upper()
-    ois = fetch_ois_curve(date.today())
+    try:
+        ois = fetch_ois_curve(date.today())
+    except Exception as e:
+        from pricing_lib.market_data.rates import flat_ois_curve
+        print(f"[Backtest] ⚠ Courbe €STR indisponible ({type(e).__name__}) — courbe plate 2 %.")
+        ois = flat_ois_curve(0.02, date.today())
 
     try:
         dy  = fetch_dividend(ticker)

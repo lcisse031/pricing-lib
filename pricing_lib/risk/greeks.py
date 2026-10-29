@@ -177,9 +177,8 @@ def compute_greeks_fd_vol(
     Greeks par différences finies CENTRÉES, le paramètre de vol étant σ.
 
     price_fn(S, r, q, sigma, T) -> float
-    price0 : prix de base déjà calculé (= p_0, évite un repricing).
-
-    9 repricings (les 2 pour S servent à delta ET gamma).
+    price0 : conservé pour compatibilité ; p_0 est repricé avec price_fn pour
+             que base et chocs partagent le même tirage en MC.
     Le `ratio`/quotité doit déjà être incorporé dans price_fn.
 
     Mode d'emploi :
@@ -190,7 +189,7 @@ def compute_greeks_fd_vol(
     dT   = dT_days / 365.0
     sv_dn = max(sigma - dvol, 1e-6)
 
-    p_0        = price0
+    p_0        = price_fn(S, r, q, sigma, T)
     p_S_up     = price_fn(S + dS, r,      q, sigma,      T)
     p_S_down   = price_fn(S - dS, r,      q, sigma,      T)
     p_vol_up   = price_fn(S,      r,      q, sigma + dvol, T)
@@ -230,19 +229,18 @@ def compute_greeks_fd_heston(
     Greeks par différences finies CENTRÉES sous Heston.
 
     price_fn(S, r, q, T, params) -> float
-    price0 : prix de base déjà calculé (= p_0).
+    price0 : conservé pour compatibilité (p_0 est repricé).
 
     Vega : choc de NIVEAU DE VOL — shift parallèle de ±dv POINTS de vol
            appliqué à √v0 ET √θ, puis reconverti en variance (v = σ²).
            Rapporté par +1 point de vol (× 0.01), MÊME unité que le vega vanille.
 
-    Le MÊME seed doit être utilisé par price_fn pour p_0 et tous les chocs
-    (resimulation complète à chaque bump) → variance MC corrélée, Greeks stables.
+    price_fn doit utiliser le même seed pour tous les repricings.
     """
     dS = S * dS_frac
     dT = dT_days / 365.0
 
-    p_0      = price0
+    p_0      = price_fn(S, r, q, T, params)
     p_S_up   = price_fn(S + dS, r,      q, T,      params)
     p_S_down = price_fn(S - dS, r,      q, T,      params)
 
@@ -273,7 +271,7 @@ def compute_greeks_fd_heston(
     )
 
 
-# Alias de compatibilité ascendante (ancien nom utilisé ailleurs).
+# Alias historique
 compute_greeks_gbm_vanilla = compute_greeks_fd_vol
 
 
@@ -311,6 +309,7 @@ class _BumpedMarket:
     def __init__(self, base, spot: Optional[float] = None,
                  sigma_bump: float = 0.0, rate_bump: float = 0.0) -> None:
         self._base          = base
+        self.vol_shift      = float(sigma_bump or 0.0)
         self.ticker         = base.ticker
         self.valuation_date = base.valuation_date
         self.div_curve      = base.div_curve

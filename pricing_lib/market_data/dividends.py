@@ -29,7 +29,7 @@ _ZB_CODES: Dict[str, str] = {
     "ENGI":  "ENGIE-4995",
     "EL":    "ESSILORLUXOTTICA-4641",
     "ERF":   "EUROFINS-SCIENTIFIC-SE-4753",
-    "ENX":   "EEURONEXT-N-V-16725768",
+    "ENX":   "EURONEXT-N-V-16725768",
     "RMS":   "HERMES-INTERNATIONAL-4657",
     "KER":   "KERING-4683",
     "LR":    "LEGRAND-16719",
@@ -245,9 +245,9 @@ def fetch_dividend(ticker: str) -> DividendYield:
     last_hist  = _val(yields[max(historical)]) if historical else 0.0
     next_est   = _val(yields[min(estimated)])  if estimated  else 0.0
 
-    hist_vals = sorted(
-        [_val(d) for d in historical.values()], reverse=True
-    )[:3]
+    # moyenne des 3 dernières années publiées
+    last3     = sorted(historical, reverse=True)[:3]
+    hist_vals = [_val(historical[y]) for y in last3]
     avg_3y = sum(hist_vals) / len(hist_vals) if hist_vals else 0.0
 
     return DividendYield(

@@ -65,10 +65,14 @@ _TICKER_MAP = {
     "CA":    "CA4",    # Carrefour
     "ACA":   "CR4",   # Crédit Agricole
     "BN":    "BN4",    # Danone
+
+    # --- Luxe & Cosmétiques ---
     "MC":    "MC4",    # LVMH
     "RMS":   "HE4",   # Hermès International
     "OR":    "OR4",    # L'Oréal
     "KER":   "KR4",   # Kering
+
+    # --- Industrie & Aéronautique ---
     "SAF":   "SM4",   # Safran
     "HO":    "HO4",    # Thales
     "SU":    "SU4",    # Schneider Electric
@@ -76,23 +80,48 @@ _TICKER_MAP = {
     "LR":    "LR4",    # Legrand
     "MT":    "MT9",    # ArcelorMittal
     "STMPA": "STM4",   # STMicroelectronics
+
+    # --- Finance & Assurance ---
+    "CS":    "CS4",    # AXA
+
+    # --- Énergie ---
     "TTE":   "TO4",   # TotalEnergies
     "ENGI":  "ENGI4",  # Engie
+    "VIE":   "VIE4",   # Veolia Environnement
+
+    # --- Santé ---
     "SAN":   "ZA4",   # Sanofi
     "EL":    "EL4",    # EssilorLuxottica
     "ERF":   "ERF4",   # Eurofins Scientific
+
+    # --- BTP & Concessions ---
     "DG":    "DG4",    # Vinci
     "FGR":   "FGR4",   # Eiffage
+
+    # --- Automobile ---
     "STLAP": "STL4",   # Stellantis
     "ML":    "ML4",    # Michelin
+    "RNO":   "RN4",   # Renault
+
+    # --- Technologie ---
     "DSY":   "DS4",   # Dassault Systèmes
     "CAP":   "CP4",   # Capgemini
+
+    # --- Agroalimentaire ---
     "RI":    "RI4",    # Pernod Ricard
+
+    # --- Télécoms ---
     "ORA":   "FT4",   # Orange
+
+    # --- Services ---
     "BVI":   "BVI4",   # Bureau Veritas
     "PUB":   "PU4",   # Publicis Groupe
     "ENX":   "ENX4",   # Euronext
+
+    # --- Hôtellerie & Distribution ---
     "AC":    "AC4",    # Accor
+
+    # --- Immobilier ---
     "URW":   "UB9",   # Unibail-Rodamco-Westfield
 }
 
@@ -340,8 +369,8 @@ def _interpolate_vol_surface(
     """
     Interpole σ_IV(T, K) sur la bande [K_lo, K_hi].
     Passe 1 : PCHIP en K par maturité.
-    Passe 2 : PCHIP en T par strike.
-    Passe 3 : ffill/bfill pour les bords résiduels.
+    Passe 2 : PCHIP en T par strike (à l'intérieur de la plage observée).
+    Passe 3 : prolongement plat en strike, maturité par maturité.
     Passe 4 : smoothing léger [0.25, 0.5, 0.25] en K.
     """
     band = grid_raw.loc[
@@ -371,7 +400,10 @@ def _interpolate_vol_surface(
         if missing.any():
             band.loc[T_all[missing], k] = np.clip(interp(T_all[missing]), 0.01, 5.0)
 
-    band = band.ffill(axis=0).bfill(axis=0).ffill(axis=1).bfill(axis=1)
+    band = band.ffill(axis=1).bfill(axis=1)
+    band = band.dropna(axis=0, how="all")
+    if band.isna().any().any():
+        band = band.ffill(axis=0).bfill(axis=0)
 
     arr = band.to_numpy(dtype=float)
     s = arr.copy()
@@ -466,6 +498,11 @@ class VolSurface:
 
             K = float(row["strike"])
             opt_type = str(row["type"]).upper()
+
+            # Options hors de la monnaie uniquement (puts sous le forward, calls au-dessus)
+            F_T = spot * math.exp((r - q) * T)
+            if (opt_type == "C" and K < F_T) or (opt_type == "P" and K >= F_T):
+                continue
 
             # Récupère le prix
             mid = row.get("mid")
@@ -768,6 +805,24 @@ def _cache_path(ticker: str) -> str:
     return os.path.join(cache_dir, f"{ticker.upper()}.npz")
 
 
+def load_cached_surface(ticker: str, spot: float, r: float, q: float) -> Optional[VolSurface]:
+    """
+    Dernière surface EOD en cache (None si absente), strikes ramenés au spot courant.
+    """
+    cache = _cache_path(ticker)
+    if not os.path.exists(cache):
+        return None
+    cached = VolSurface.load(cache)
+    scale = spot / cached.spot if cached.spot > 0 else 1.0
+    return VolSurface(date.today(), spot, r, q, cached.tenors, cached.strikes * scale, cached.vols)
+
+
+def save_surface_cache(ticker: str, surf: VolSurface) -> None:
+    """Sauvegarde la surface comme cache EOD si elle est assez riche."""
+    if len(surf.tenors) >= 3 and len(surf.strikes) >= 5:
+        surf.save(_cache_path(ticker))
+
+
 def build_surface(ticker: str, spot: float) -> VolSurface:
     """
     Construit une VolSurface en UNE LIGNE.
@@ -809,11 +864,8 @@ def build_surface(ticker: str, spot: float) -> VolSurface:
     if surf is None or len(surf.tenors) < 2 or len(surf.strikes) < 2:
         if os.path.exists(cache):
             print(f"[VolSurface] Marché fermé ou données insuffisantes — chargement du cache EOD.")
-            surf = VolSurface.load(cache)
-            # Met à jour spot/r/q avec les valeurs courantes
-            surf.spot = spot
-            surf.r    = r
-            surf.q    = q
+
+            surf = load_cached_surface(t, spot, r, q)
         else:
             print(f"[VolSurface] Aucun cache disponible pour {t} — surface plate 25%.")
             surf = VolSurface.flat(date.today(), spot, r, q, sigma=0.25)
@@ -888,3 +940,5 @@ def _parse_maturity_to_yyyy_mm(s: str) -> str:
         return f"{year}-{month_num}"
 
     return s
+
+
